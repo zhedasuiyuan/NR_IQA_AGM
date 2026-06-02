@@ -39,7 +39,7 @@ from configs.default import MODEL_CONFIG, DATASET_PATHS, _make_dataset_paths
 from dataset import (
     KonIQ_10K, CLIVE_inmemory, SPAQ, KADID10K, FLIVE, AGIQA3K, AGIQA1K,
 )
-from models import MLP3_Gated, SIGLIPWithMLP
+from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
 from util import margin_loss, metric, Overlay
 
@@ -159,6 +159,13 @@ def run_eval(args):
     model.eval()
     mlp.eval()
 
+    # ── Multi-layer fusion (optional, if the checkpoint carries one) ──────
+    fusion = None
+    fusion_path = os.path.join(ckpt_dir, "fusion.pt")
+    if os.path.exists(fusion_path):
+        fusion = MultiLayerFusion.load(fusion_path, map_location=device).to(device).eval()
+        print(f"Loaded multi-layer fusion: {fusion.config}")
+
     # ── Dataset ──────────────────────────────────────────────────────────
     dataset = _load_eval_dataset(args.dataset, dataset_paths)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
@@ -168,6 +175,7 @@ def run_eval(args):
         base_model=model.float(),
         mlp_head=mlp.float(),
         device=device,
+        fusion=(fusion.float() if fusion is not None else None),
     ).to(device).eval()
 
     # ── Inference loop ───────────────────────────────────────────────────

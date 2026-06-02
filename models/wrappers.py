@@ -5,6 +5,8 @@ Author: Ankit Yadav
 import warnings
 import torch.nn as nn
 
+from .multi_layer_fusion import extract_token_features, native_pool
+
 
 class SIGLIPWithMLP(nn.Module):
     """Wraps a vision backbone (SigLIP / DINOv2 / ResNet) together with an MLP
@@ -16,17 +18,29 @@ class SIGLIPWithMLP(nn.Module):
         device: torch device.
         layer: layer index used by perception-style encoders.
         resnet: set True when the backbone is a ResNet.
+        fusion: optional ``MultiLayerFusion`` module. When set, features come
+            from tapping multiple layers, fusing them at the token level, and
+            running the backbone's native pooler -- instead of the single-layer
+            ``get_image_features`` path.
     """
 
-    def __init__(self, base_model, mlp_head, device, layer=18, resnet=False):
+    def __init__(self, base_model, mlp_head, device, layer=18, resnet=False, fusion=None):
         super().__init__()
         self.siglip   = base_model
         self.mlp_head = mlp_head
         self.device   = device
         self.layer    = layer
         self.resnet   = resnet
+        self.fusion   = fusion
 
     def forward(self, inputs):
+        if self.fusion is not None:
+            feats, trunk = extract_token_features(self.siglip, inputs, self.fusion.layer_indices)
+            fused = self.fusion(feats, trunk)
+            features = native_pool(self.siglip, fused)
+            scores = self.mlp_head(features)
+            return scores.squeeze(1)
+
         if self.resnet:
             warnings.warn(
                 "ResNet152 backbone detected — using pooler_output. "

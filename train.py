@@ -56,7 +56,7 @@ from dataset import (
     SPAQ, KADID10K, FLIVE,
     AGIQA3K, AGIQA1K,
 )
-from models import MLP3_Gated, SIGLIPWithMLP
+from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion, extract_token_features, native_pool
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
 from seed import Seed, seed_worker
 from util import margin_loss, metric, Overlay, BAD_QUALITY_PROMPT, Text_Template_baseline
@@ -158,7 +158,7 @@ def _db_name(loader):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False):
+def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusion=None):
     """Run inference on *dataloader_eval* and return (results_dict, avg_loss).
 
     The model and MLP are deep-copied so evaluation doesn't affect the
@@ -166,12 +166,14 @@ def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False):
     """
     model_copy = copy.deepcopy(model)
     mlp_copy   = copy.deepcopy(mlp)
+    fusion_copy = copy.deepcopy(fusion) if fusion is not None else None
 
     base = model_copy.module if hasattr(model_copy, "module") else model_copy
     combined = SIGLIPWithMLP(
         base_model=base.float(),
         mlp_head=mlp_copy.float(),
         device=device,
+        fusion=(fusion_copy.float() if fusion_copy is not None else None),
     ).to(device).eval()
 
     all_preds, all_labels = [], []
@@ -300,6 +302,21 @@ def train(args):
     model.requires_grad_(True)
     mlp.requires_grad_(True)
 
+    # ── Multi-layer fusion (optional) ────────────────────────────────────
+    fusion = None
+    if args.fusion_type != "none":
+        fusion = MultiLayerFusion.from_backbone(
+            model,
+            fusion_type=args.fusion_type,
+            stride=args.fusion_stride,
+            adaptive_conditioning=args.adaptive_conditioning,
+            adaptive_norm=args.adaptive_norm,
+        ).to(device).to(torch.bfloat16)
+        fusion.requires_grad_(True)
+        print(f"Multi-layer fusion: type={args.fusion_type} "
+              f"layers(hidden_states idx)={fusion.layer_indices} "
+              f"conditioning={args.adaptive_conditioning} norm={args.adaptive_norm}")
+
     # ── Dataset / DataLoader ─────────────────────────────────────────────
     train_ds, eval_ds = build_datasets(args.dataset, dataset_paths, Seed)
     train_loader = DataLoader(
@@ -312,8 +329,11 @@ def train(args):
     )
 
     # ── Optimizer / Scheduler ────────────────────────────────────────────
+    trainable_params = list(model.parameters()) + list(mlp.parameters())
+    if fusion is not None:
+        trainable_params += list(fusion.parameters())
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(mlp.parameters()),
+        trainable_params,
         lr=cfg["learning_rate"],
         weight_decay=cfg["weight_decay"],
     )
@@ -345,17 +365,30 @@ def train(args):
 
     model.train()
     mlp.train()
+    if fusion is not None:
+        fusion.train()
+
+    # The tapped indices are needed in the training loop; capture them before
+    # `prepare` wraps `fusion` (the wrapper hides plain attributes).
+    fusion_layer_indices = fusion.layer_indices if fusion is not None else None
 
     # ── Accelerator prepare ──────────────────────────────────────────────
-    model, mlp, optimizer, scheduler, train_loader = accelerator.prepare(
-        model, mlp, optimizer, scheduler, train_loader,
-    )
+    if fusion is not None:
+        model, mlp, fusion, optimizer, scheduler, train_loader = accelerator.prepare(
+            model, mlp, fusion, optimizer, scheduler, train_loader,
+        )
+    else:
+        model, mlp, optimizer, scheduler, train_loader = accelerator.prepare(
+            model, mlp, optimizer, scheduler, train_loader,
+        )
 
     if ckpt is not None:
         accelerator.unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
         mlp.load_state_dict(ckpt["mlp_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if fusion is not None and ckpt.get("fusion_state_dict") is not None:
+            accelerator.unwrap_model(fusion).load_state_dict(ckpt["fusion_state_dict"])
 
     # ── WandB ────────────────────────────────────────────────────────────
     use_wandb = not args.no_wandb
@@ -390,10 +423,17 @@ def train(args):
                 images = batch["image"].to(device)
                 inputs = processor(images=images, return_tensors="pt").to(model.device)
 
-                try:
-                    features = model.module.get_image_features(**inputs)
-                except Exception:
-                    features = model.get_image_features(**inputs)
+                if fusion is not None:
+                    feats, trunk = extract_token_features(
+                        model, inputs["pixel_values"], fusion_layer_indices
+                    )
+                    fused = fusion(feats, trunk)
+                    features = native_pool(model, fused)
+                else:
+                    try:
+                        features = model.module.get_image_features(**inputs)
+                    except Exception:
+                        features = model.get_image_features(**inputs)
 
                 score = mlp(features)
                 loss_mse    = torch.nn.functional.mse_loss(score.squeeze(1), batch["score"].to(device))
@@ -429,6 +469,8 @@ def train(args):
                     ckpt_dir = f"checkpoints/{stage}_step_train_{train_db}_Test{eval_db}_{global_step}/"
                     accelerator.unwrap_model(model).save_pretrained(ckpt_dir)
                     torch.save(mlp.state_dict(), f"{ckpt_dir}/mlp.pt")
+                    if fusion is not None:
+                        accelerator.unwrap_model(fusion).save(f"{ckpt_dir}/fusion.pt")
                     _clean_old_checkpoints(stage, cfg["max_checkpoints"])
 
                 # Per-step logging
@@ -455,6 +497,7 @@ def train(args):
                 results, avg_eval = evaluate(
                     model, mlp, processor, eval_loader, device,
                     dry_run=cfg["dry_run"],
+                    fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
                 )
                 SRCC = results["SRCC"]
                 PLCC = results["PLCC"]
@@ -474,6 +517,8 @@ def train(args):
                 best_dir = f"best_checkpoints/{stage}_train_{train_db}_test_{eval_db}"
                 accelerator.unwrap_model(model).save_pretrained(best_dir)
                 torch.save(mlp.state_dict(), f"{best_dir}/mlp.pt")
+                if fusion is not None:
+                    accelerator.unwrap_model(fusion).save(f"{best_dir}/fusion.pt")
                 tqdm.write(f"  [Best] SRCC={best_SRCC:.4f} saved to {best_dir}")
 
             # ── Resume state at epoch end ─────────────────────────────────
@@ -489,12 +534,17 @@ def train(args):
                     "patience_counter":   patience_ctr,
                     "mlp_state_dict":     mlp.state_dict(),
                     "best_SRCC":          best_SRCC,
+                    "fusion_state_dict":  (accelerator.unwrap_model(fusion).state_dict()
+                                           if fusion is not None else None),
                 }, resume_path)
 
     # ── Final evaluation ─────────────────────────────────────────────────
     if cfg["do_eval"]:
         print("Final evaluation ...")
-        results, avg_eval = evaluate(model, mlp, processor, eval_loader, device, dry_run=cfg["dry_run"])
+        results, avg_eval = evaluate(
+            model, mlp, processor, eval_loader, device, dry_run=cfg["dry_run"],
+            fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
+        )
         print(f"  SRCC: {results['SRCC']:.4f}  PLCC: {results['PLCC']:.4f}  loss: {avg_eval:.4f}")
         if use_wandb and accelerator.is_main_process:
             wandb.log({f"{stage}_SRCC": results["SRCC"], f"{stage}_PLCC": results["PLCC"]})
@@ -505,6 +555,8 @@ def train(args):
         final_dir = f"checkpoints/{stage}_final_train_{train_db}_Test{eval_db}/"
         accelerator.unwrap_model(model).save_pretrained(final_dir)
         torch.save(mlp.state_dict(), f"{final_dir}/mlp.pt")
+        if fusion is not None:
+            accelerator.unwrap_model(fusion).save(f"{final_dir}/fusion.pt")
 
         os.makedirs("results", exist_ok=True)
         res_path = f"results/results_{stage}_Train_{train_db}_Test_{eval_db}.json"
@@ -538,6 +590,24 @@ def parse_args():
     # Model
     p.add_argument("--model_id", type=str, default=MODEL_CONFIG["model_id"])
     p.add_argument("--mlp_input_dim", type=int, default=MODEL_CONFIG["mlp_input_dim"])
+
+    # Multi-layer fusion
+    p.add_argument("--fusion_type", type=str, default="none",
+                   choices=["none", "mls", "adaptive"],
+                   help="Multi-layer feature fusion before the MLP head. "
+                        "'none' = vanilla single-layer get_image_features; "
+                        "'mls' = RAE-V2 multi-layer sum (hard replace); "
+                        "'adaptive' = learned weighted residual (step-0 identical).")
+    p.add_argument("--fusion_stride", type=int, default=4,
+                   help="Tap every Nth block, right-anchored on the last block "
+                        "(stride=1 taps all layers). Resolved per-backbone from depth.")
+    p.add_argument("--adaptive_conditioning", type=str, default="static",
+                   choices=["uniform", "static", "image"],
+                   help="Adaptive weight source: 'uniform' (fixed 1/L baseline), "
+                        "'static' (learned [L] vector), 'image' (MLP of pooled trunk).")
+    p.add_argument("--adaptive_norm", type=str, default="softmax",
+                   choices=["softmax", "sigmoid"],
+                   help="Adaptive weight normalisation.")
 
     # PEFT
     p.add_argument("--peft_method", type=str, default=TRAIN_CONFIG["peft_method"],
