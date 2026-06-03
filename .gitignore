@@ -12,7 +12,8 @@ results/
 grad_cam/
 grad_cam_eval/
 
-# WandB
+# Experiment trackers
+.aim/
 wandb/
 
 # Cached embeddings

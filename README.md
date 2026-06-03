@@ -156,8 +156,11 @@ python train.py --dataset KonIQ_10K --resume
 # Dry-run for quick debugging (100 train batches, 32 eval batches)
 python train.py --dataset CLIVE --dry_run
 
-# Disable WandB logging
-python train.py --dataset CLIVE --no_wandb
+# Experiment tracking uses Aim by default (free, self-hosted). View runs with:
+#   aim up
+# Switch backend or disable tracking
+python train.py --dataset CLIVE --tracker wandb
+python train.py --dataset CLIVE --tracker none
 ```
 
 ### Key Training Arguments
@@ -168,16 +171,19 @@ python train.py --dataset CLIVE --no_wandb
 | `--data_dir` | `./Dataset` | Root directory of all datasets |
 | `--model_id` | `google/siglip2-so400m-patch16-512` | HuggingFace backbone |
 | `--peft_method` | `LoRA` | `LoRA`, `DPT`, or `NA` |
+| `--lora_targets` | `q_proj,v_proj` | LoRA target projections (vision tower), or `all-linear` |
 | `--epochs` | `15` | Number of training epochs |
 | `--batch_size` | `2` | Per-device batch size |
-| `--lr` | `1e-4` | Learning rate |
+| `--lr` | `1e-4` | Head (MLP + fusion) LR; also the backbone LR for LoRA/DPT |
+| `--backbone_lr` | `=--lr` (LoRA/DPT), `5e-6` (full FT) | Backbone LR; full FT defaults to the paper's conservative `5e-6` |
 | `--grad_accum` | `6` | Gradient accumulation steps (effective batch = batch_size * grad_accum) |
 | `--lr_milestones` | `30,35` | Comma-separated epoch milestones for MultiStepLR |
 | `--checkpoint_steps` | `5000` | Save a checkpoint every N steps |
 | `--stage_name` | `AGM_seed8` | Prefix for checkpoint directories |
 | `--resume` | off | Resume from the latest `resume_state/` file |
 | `--dry_run` | off | Fast debugging mode |
-| `--no_wandb` | off | Disable Weights & Biases logging |
+| `--tracker` | `aim` | Experiment tracker: `aim`, `wandb`, or `none` |
+| `--project` | `NR_IQA_AGM` | Tracker project / experiment name |
 | `--no_eval` | off | Skip evaluation during training |
 | `--eval_every` | `1` | Evaluate every N epochs |
 

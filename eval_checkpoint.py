@@ -384,7 +384,7 @@ def run_eval(ckpt_dir: str, dataset_id: str, data_dir: str = "./Dataset",
 
             loss = (
                 torch.nn.functional.mse_loss(preds, gt)
-                + margin_loss(preds, gt)
+                + margin_loss(gt, preds)
             )
             total_loss += loss.item()
             n_batches  += 1

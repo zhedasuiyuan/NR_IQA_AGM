@@ -47,7 +47,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 
-import wandb
+from tracker import Tracker
 
 from configs.default import MODEL_CONFIG, TRAIN_CONFIG, DATASET_PATHS, _make_dataset_paths
 from dataset import (
@@ -193,7 +193,7 @@ def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusi
             preds    = combined(inputs["pixel_values"])
 
             loss_mse = torch.nn.functional.mse_loss(preds, gt)
-            loss_mrg = margin_loss(preds, gt)
+            loss_mrg = margin_loss(gt, preds)
             total_loss += (loss_mse + loss_mrg).item()
             n_batches  += 1
 
@@ -226,6 +226,9 @@ def train(args):
         "epochs":                       args.epochs,
         "batch_size":                   args.batch_size,
         "learning_rate":                args.lr,
+        "backbone_lr":                  (args.backbone_lr if args.backbone_lr is not None
+                                         else (TRAIN_CONFIG["full_ft_backbone_lr"]
+                                               if args.peft_method == "NA" else args.lr)),
         "weight_decay":                 args.weight_decay,
         "checkpoint_steps":             args.checkpoint_steps,
         "max_checkpoints":              args.max_checkpoints,
@@ -240,12 +243,19 @@ def train(args):
         "gradient_clip":                args.gradient_clip,
         "resume":                       args.resume,
         "dry_run":                      args.dry_run,
-        "wandb_project":                args.wandb_project,
+        "tracker":                      ("none" if args.no_wandb else args.tracker),
+        "project":                      args.project,
     })
     if args.lora_r is not None:
         cfg["lora_config"]["r"]            = args.lora_r
         cfg["lora_config"]["lora_alpha"]   = args.lora_alpha
         cfg["lora_config"]["lora_dropout"] = args.lora_dropout
+    if args.lora_targets is not None:
+        if args.lora_targets.strip() == "all-linear":
+            cfg["lora_config"]["target_modules"] = "all-linear"
+        else:
+            names = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+            cfg["lora_config"]["target_modules"] = rf"vision_model\..*\.({'|'.join(names)})$"
 
     dataset_paths = _make_dataset_paths(args.data_dir)
 
@@ -263,7 +273,7 @@ def train(args):
 
     # ── PEFT ─────────────────────────────────────────────────────────────
     if cfg["peft_method"] == "LoRA":
-        print("Applying LoRA ...")
+        print(f"Applying LoRA (targets={cfg['lora_config']['target_modules']}) ...")
         lora_cfg = LoraConfig(
             r=cfg["lora_config"]["r"],
             lora_alpha=cfg["lora_config"]["lora_alpha"],
@@ -325,18 +335,24 @@ def train(args):
     )
     eval_loader = DataLoader(
         eval_ds, batch_size=cfg["batch_size"], shuffle=False,
-        drop_last=True, worker_init_fn=seed_worker,
+        drop_last=False, worker_init_fn=seed_worker,
     )
 
     # ── Optimizer / Scheduler ────────────────────────────────────────────
-    trainable_params = list(model.parameters()) + list(mlp.parameters())
+    # Two param groups: the backbone (group 0) and the head — MLP + optional
+    # fusion (group 1). For LoRA/DPT both default to --lr; for full FT the
+    # backbone uses the paper's conservative 5e-6 while the head stays at --lr.
+    head_params = list(mlp.parameters())
     if fusion is not None:
-        trainable_params += list(fusion.parameters())
+        head_params += list(fusion.parameters())
     optimizer = torch.optim.Adam(
-        trainable_params,
-        lr=cfg["learning_rate"],
+        [
+            {"params": list(model.parameters()), "lr": cfg["backbone_lr"]},
+            {"params": head_params,              "lr": cfg["learning_rate"]},
+        ],
         weight_decay=cfg["weight_decay"],
     )
+    print(f"Optimizer LRs — backbone: {cfg['backbone_lr']:.2e}  head: {cfg['learning_rate']:.2e}")
     scheduler = MultiStepLR(
         optimizer,
         milestones=cfg["lr_scheduler_milestones"],
@@ -390,16 +406,15 @@ def train(args):
         if fusion is not None and ckpt.get("fusion_state_dict") is not None:
             accelerator.unwrap_model(fusion).load_state_dict(ckpt["fusion_state_dict"])
 
-    # ── WandB ────────────────────────────────────────────────────────────
-    use_wandb = not args.no_wandb
-    if use_wandb and accelerator.is_main_process:
-        wandb.init(
-            project=cfg["wandb_project"],
-            name=f"{cfg['stage_name']}_{args.dataset}",
-        )
-        art = wandb.Artifact("source-code", type="code")
-        art.add_file(__file__)
-        wandb.log_artifact(art)
+    # ── Experiment tracker (Aim by default) ──────────────────────────────
+    tracker = Tracker(
+        cfg["tracker"],
+        project=cfg["project"],
+        name=f"{cfg['stage_name']}_{args.dataset}",
+        config=cfg,
+        enabled=accelerator.is_main_process,
+    )
+    tracker.log_code(__file__)
 
     train_db = _db_name(train_loader)
     eval_db  = _db_name(eval_loader)
@@ -437,7 +452,7 @@ def train(args):
 
                 score = mlp(features)
                 loss_mse    = torch.nn.functional.mse_loss(score.squeeze(1), batch["score"].to(device))
-                loss_margin = margin_loss(score.squeeze(1), batch["score"].to(device))
+                loss_margin = margin_loss(batch["score"].to(device), score.squeeze(1))
                 loss = (loss_mse + loss_margin) / cfg["gradient_accumulation_steps"]
 
                 accelerator.backward(loss)
@@ -446,12 +461,12 @@ def train(args):
                 global_step += 1
 
                 # Gate weight logging
-                if use_wandb and accelerator.is_main_process:
+                if tracker.enabled:
                     try:
                         w_mean = torch.sigmoid(mlp.module.act1.g).mean().item()
                     except AttributeError:
                         w_mean = torch.sigmoid(mlp.act1.g).mean().item()
-                    wandb.log({"gate/w_mean": w_mean}, commit=False)
+                    tracker.log({"gate/w_mean": w_mean}, step=global_step)
 
                 if global_step % cfg["gradient_accumulation_steps"] == 0:
                     if cfg["use_gradient_clip"]:
@@ -459,8 +474,8 @@ def train(args):
                     optimizer.step()
                     optimizer.zero_grad()
                     tqdm.write(f"Step {global_step} — accum loss: {accum_loss:.4f}")
-                    if use_wandb and accelerator.is_main_process:
-                        wandb.log({f"{stage}_accumulated_loss": accum_loss}, commit=False)
+                    if tracker.enabled:
+                        tracker.log({f"{stage}_accumulated_loss": accum_loss}, step=global_step)
                     accum_loss = 0.0
 
                 # Periodic checkpoint
@@ -474,18 +489,18 @@ def train(args):
                     _clean_old_checkpoints(stage, cfg["max_checkpoints"])
 
                 # Per-step logging
-                if use_wandb and accelerator.is_main_process:
-                    wandb.log({
+                if tracker.enabled:
+                    tracker.log({
                         f"{stage}_loss":  loss.item(),
                         f"{stage}_epoch": epoch + 1,
                         f"{stage}_step":  global_step,
                         f"{stage}_lr":    optimizer.param_groups[0]["lr"],
-                    })
+                    }, step=global_step)
 
             # End of epoch
             avg = total_loss / max(len(train_loader), 1)
-            if use_wandb and accelerator.is_main_process:
-                wandb.log({f"{stage}_total_loss": avg, f"{stage}_epoch": epoch + 1}, commit=False)
+            if tracker.enabled:
+                tracker.log({f"{stage}_total_loss": avg, f"{stage}_epoch": epoch + 1}, step=global_step)
             print(f"Epoch {epoch+1}/{cfg['epochs']} — avg loss: {avg:.4f}")
 
             if cfg["lr_scheduler"]:
@@ -503,12 +518,11 @@ def train(args):
                 PLCC = results["PLCC"]
                 if accelerator.is_main_process:
                     tqdm.write(f"  SRCC: {SRCC:.4f}  PLCC: {PLCC:.4f}  eval_loss: {avg_eval:.4f}")
-                    if use_wandb:
-                        wandb.log({
-                            f"{stage}_SRCC": SRCC,
-                            f"{stage}_PLCC": PLCC,
-                            f"{stage}_Avg_Eval_Loss": avg_eval,
-                        })
+                    tracker.log({
+                        f"{stage}_SRCC": SRCC,
+                        f"{stage}_PLCC": PLCC,
+                        f"{stage}_Avg_Eval_Loss": avg_eval,
+                    }, step=global_step)
 
             # ── Best checkpoint ───────────────────────────────────────────
             if accelerator.is_main_process and SRCC > best_SRCC:
@@ -546,8 +560,8 @@ def train(args):
             fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
         )
         print(f"  SRCC: {results['SRCC']:.4f}  PLCC: {results['PLCC']:.4f}  loss: {avg_eval:.4f}")
-        if use_wandb and accelerator.is_main_process:
-            wandb.log({f"{stage}_SRCC": results["SRCC"], f"{stage}_PLCC": results["PLCC"]})
+        if accelerator.is_main_process:
+            tracker.log({f"{stage}_SRCC": results["SRCC"], f"{stage}_PLCC": results["PLCC"]}, step=global_step)
 
     # ── Save final checkpoint ────────────────────────────────────────────
     if accelerator.is_main_process:
@@ -565,8 +579,7 @@ def train(args):
                 json.dump(results, f, indent=4)
             print(f"Results saved to {res_path}")
 
-    if use_wandb and accelerator.is_main_process:
-        wandb.finish()
+    tracker.finish()
 
     accelerator.free_memory()
     torch.cuda.empty_cache()
@@ -615,11 +628,19 @@ def parse_args():
     p.add_argument("--lora_r", type=int, default=None)
     p.add_argument("--lora_alpha", type=int, default=8)
     p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora_targets", type=str, default=None,
+                   help="LoRA target projections on the vision tower, comma-separated "
+                        "(e.g. 'q_proj,v_proj' or 'q_proj,k_proj,v_proj,out_proj'); "
+                        "or 'all-linear' for every Linear. Default: q_proj,v_proj.")
 
     # Training
     p.add_argument("--epochs", type=int, default=TRAIN_CONFIG["epochs"])
     p.add_argument("--batch_size", type=int, default=TRAIN_CONFIG["batch_size"])
-    p.add_argument("--lr", type=float, default=TRAIN_CONFIG["learning_rate"])
+    p.add_argument("--lr", type=float, default=TRAIN_CONFIG["learning_rate"],
+                   help="Head (MLP + fusion) LR; also the backbone LR for LoRA/DPT")
+    p.add_argument("--backbone_lr", type=float, default=None,
+                   help="Backbone LR. Default: equals --lr, except full FT "
+                        "(--peft_method NA) where it defaults to 5e-6 (paper recipe).")
     p.add_argument("--weight_decay", type=float, default=TRAIN_CONFIG["weight_decay"])
     p.add_argument("--grad_accum", type=int, default=TRAIN_CONFIG["gradient_accumulation_steps"])
     p.add_argument("--gradient_clip", type=float, default=0.0,
@@ -642,8 +663,16 @@ def parse_args():
                    help="Run evaluation every N epochs")
 
     # Logging
-    p.add_argument("--wandb_project", type=str, default=TRAIN_CONFIG["wandb_project"])
-    p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--tracker", type=str, default=TRAIN_CONFIG["tracker"],
+                   choices=["aim", "wandb", "none"],
+                   help="Experiment tracker backend (default: aim)")
+    p.add_argument("--project", type=str, default=TRAIN_CONFIG["project"],
+                   help="Tracker project / experiment name")
+    p.add_argument("--wandb_project", dest="project", type=str,
+                   default=argparse.SUPPRESS,
+                   help="[deprecated] alias for --project")
+    p.add_argument("--no_wandb", action="store_true",
+                   help="[deprecated] alias for --tracker none")
 
     # Debug
     p.add_argument("--dry_run", action="store_true",

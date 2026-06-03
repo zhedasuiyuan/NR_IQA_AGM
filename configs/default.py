@@ -15,6 +15,7 @@ TRAIN_CONFIG = {
     "epochs": 15,
     "batch_size": 2,
     "learning_rate": 1e-4,
+    "full_ft_backbone_lr": 5e-6,         # backbone LR for full FT (peft_method=NA); head stays at learning_rate
     "weight_decay": 0,
     "checkpoint_steps": 5000,
     "max_checkpoints": 5,
@@ -24,14 +25,17 @@ TRAIN_CONFIG = {
         "r": 4,
         "lora_alpha": 8,
         "lora_dropout": 0.05,
-        "target_modules": r".*\.(q_proj|k_proj)$",
+        # q+v on the vision tower only (the text tower is unused by get_image_features).
+        # Override via --lora_targets, e.g. "q_proj,k_proj,v_proj,out_proj" or "all-linear".
+        "target_modules": r"vision_model\..*\.(q_proj|v_proj)$",
     },
     "dpt_config": {
         "no_learnable_tokens": 200,
     },
     "peft_method": "LoRA",               # "LoRA", "DPT", or "NA" (full FT)
 
-    "wandb_project": "NR_IQA_AGM",
+    "tracker": "aim",                    # "aim" (default), "wandb", or "none"
+    "project": "NR_IQA_AGM",             # tracker project / experiment name
     "gradient_accumulation_steps": 6,
     "do_eval": True,
     "eval_epoch_steps": 1,

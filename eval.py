@@ -84,7 +84,15 @@ def _load_eval_dataset(dataset_id: str, paths: dict):
 # ---------------------------------------------------------------------------
 
 PRETRAINED_CHECKPOINTS = {
-    "CLIVE": "pretrained_checkpoints/Baseline_param_activation_gating_MSE_seed8_step_train_CLIVE_TestCLIVE_14010",
+    "CLIVE": "pretrained_checkpoints/Baseline_param_activation_gating_MSE_seed8_train_CLIVE_test_CLIVE",
+}
+
+# Cross-dataset ids resolve to (train_db, test_db); within-dataset ids use the
+# same db for both. Mirrors _load_eval_dataset's CROSS_DATASET_TEST so checkpoint
+# selection matches the full train/test pair, not just the test set.
+_CHECKPOINT_DB_PAIR = {
+    "KonIQ_10K_CLIVE": ("KonIQ_10K", "CLIVE"),
+    "CLIVE_KonIQ_10K": ("CLIVE", "KonIQ_10K"),
 }
 
 
@@ -101,15 +109,20 @@ def _find_checkpoint(stage_name: str, dataset_id: str) -> str:
             print(f"Using pretrained checkpoint: {path}")
             return path
 
-    # 2) User-trained best checkpoints
+    # 2) User-trained best checkpoints. Match the full train/test pair so a
+    #    within-dataset request (CLIVE -> *_train_CLIVE_test_CLIVE) never selects
+    #    a cross-dataset checkpoint (*_train_KonIQ_10K_test_CLIVE).
+    train_db, test_db = _CHECKPOINT_DB_PAIR.get(dataset_id, (dataset_id, dataset_id))
+    suffix = f"_train_{train_db}_test_{test_db}"
     for search_dir in ("best_checkpoints", "pretrained_checkpoints"):
-        pattern = f"{search_dir}/{stage_name}*_test_{dataset_id}"
-        matches = sorted(glob(pattern), key=os.path.getctime)
+        matches = sorted(glob(f"{search_dir}/{stage_name}*{suffix}"), key=os.path.getctime)
         if not matches:
-            pattern = f"{search_dir}/*_test_{dataset_id}"
-            matches = sorted(glob(pattern), key=os.path.getctime)
+            matches = sorted(glob(f"{search_dir}/*{suffix}"), key=os.path.getctime)
         if matches:
-            chosen = matches[-1]
+            # eval.py supports the B_Gated (MLP3_Gated) head only; prefer a
+            # gating checkpoint when the suffix also matches other architectures.
+            gating = [m for m in matches if "gating" in os.path.basename(m).lower()]
+            chosen = (gating or matches)[-1]
             print(f"Auto-selected checkpoint: {chosen}")
             return chosen
 
@@ -191,7 +204,7 @@ def run_eval(args):
 
             loss = (
                 torch.nn.functional.mse_loss(preds, gt)
-                + margin_loss(preds, gt)
+                + margin_loss(gt, preds)
             )
             total_loss += loss.item()
             n_batches  += 1

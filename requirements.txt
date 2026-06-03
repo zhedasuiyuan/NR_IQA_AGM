@@ -25,6 +25,8 @@ datasets==3.4.1
 diffusers==0.32.2
 
 # --- Logging ---
+# Aim is the default experiment tracker; wandb is kept as an optional backend.
+aim==3.29.1
 wandb==0.19.8
 
 # --- Scientific / numerical ---
