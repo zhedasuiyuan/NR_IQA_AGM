@@ -291,6 +291,7 @@ def train(args):
         model.print_trainable_parameters()
     else:
         print("Full fine-tuning (no PEFT adapter).")
+        model.requires_grad_(True)
 
     # ── MLP head ─────────────────────────────────────────────────────────
     mlp = MLP3_Gated(input_dim=args.mlp_input_dim).to(device).to(torch.bfloat16)
@@ -299,7 +300,6 @@ def train(args):
             if isinstance(m, (ParamSigmoid2, ParamLeakyReLU2)):
                 m.float()
 
-    model.requires_grad_(True)
     mlp.requires_grad_(True)
 
     # ── Multi-layer fusion (optional) ────────────────────────────────────
