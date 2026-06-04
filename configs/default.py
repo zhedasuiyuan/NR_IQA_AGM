@@ -25,9 +25,10 @@ TRAIN_CONFIG = {
         "r": 4,
         "lora_alpha": 8,
         "lora_dropout": 0.05,
-        # q+v on the vision tower only (the text tower is unused by get_image_features).
-        # Override via --lora_targets, e.g. "q_proj,k_proj,v_proj,out_proj" or "all-linear".
-        "target_modules": r"vision_model\..*\.(q_proj|v_proj)$",
+        # q+k on the vision tower only (matches the original repo; the text tower is
+        # unused by get_image_features). Override via --lora_targets, e.g.
+        # "q_proj,v_proj", "q_proj,k_proj,v_proj,out_proj", or "all-linear".
+        "target_modules": r"vision_model\..*\.(q_proj|k_proj)$",
     },
     "dpt_config": {
         "no_learnable_tokens": 200,

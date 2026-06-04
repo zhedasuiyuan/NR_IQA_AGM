@@ -74,7 +74,7 @@ class KonIQ_10K(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        image_name, score = self.data.iloc[idx]['image_name'], self.data.iloc[idx]['MOS']/100 # As done in reference paper
+        image_name, score = self.data.iloc[idx]['image_name'], (self.data.iloc[idx]['MOS'] - 1) / 4  # MOS is on a 1-5 scale -> normalise to [0,1]
         image_path = os.path.join(self.image_dir, image_name)
         image = Image.open(image_path).convert('RGB')
         image = image.resize((self.image_size, self.image_size)) # Set this to 224, 224 for saving gpu memory # Set this to 512x512
@@ -114,8 +114,8 @@ class KonIQ_10K_inmemory(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        image_name, score = self.data.iloc[idx]['image_name'], self.data.iloc[idx]['MOS']/100 # As done in reference paper
-       
+        image_name, score = self.data.iloc[idx]['image_name'], (self.data.iloc[idx]['MOS'] - 1) / 4  # MOS is on a 1-5 scale -> normalise to [0,1]
+
         image = self.images[idx]
         image = torch.from_numpy(np.array(image).transpose(2, 0, 1)).float()
         score = torch.tensor(score).float()

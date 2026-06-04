@@ -171,7 +171,7 @@ python train.py --dataset CLIVE --tracker none
 | `--data_dir` | `./Dataset` | Root directory of all datasets |
 | `--model_id` | `google/siglip2-so400m-patch16-512` | HuggingFace backbone |
 | `--peft_method` | `LoRA` | `LoRA`, `DPT`, or `NA` |
-| `--lora_targets` | `q_proj,v_proj` | LoRA target projections (vision tower), or `all-linear` |
+| `--lora_targets` | `q_proj,k_proj` | LoRA target projections (vision tower), or `all-linear` |
 | `--epochs` | `15` | Number of training epochs |
 | `--batch_size` | `2` | Per-device batch size |
 | `--lr` | `1e-4` | Head (MLP + fusion) LR; also the backbone LR for LoRA/DPT |

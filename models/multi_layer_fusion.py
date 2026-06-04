@@ -277,8 +277,22 @@ class MultiLayerFusion(nn.Module):
         )
 
     @classmethod
-    def from_backbone(cls, model: nn.Module, *, fusion_type: str, stride: int, **kwargs) -> "MultiLayerFusion":
-        layer_indices = resolve_fusion_layers(backbone_num_hidden_layers(model), stride)
+    def from_backbone(cls, model: nn.Module, *, fusion_type: str, stride: int = 4,
+                      layer_indices: Optional[List[int]] = None, **kwargs) -> "MultiLayerFusion":
+        """Build from a backbone. Layers are chosen either by ``stride`` (right-anchored
+        stride selection) or, when ``layer_indices`` is given, from those explicit
+        ``hidden_states`` block indices (1..num_hidden_layers; 0 is the patch embedding)."""
+        num_layers = backbone_num_hidden_layers(model)
+        if layer_indices is None:
+            layer_indices = resolve_fusion_layers(num_layers, stride)
+        else:
+            layer_indices = sorted(set(int(i) for i in layer_indices))
+            bad = [i for i in layer_indices if not (1 <= i <= num_layers)]
+            if bad:
+                raise ValueError(
+                    f"fusion layer indices {bad} out of range; valid block indices are "
+                    f"1..{num_layers} (index 0 is the patch embedding and is excluded)."
+                )
         return cls(
             fusion_type=fusion_type,
             layer_indices=layer_indices,

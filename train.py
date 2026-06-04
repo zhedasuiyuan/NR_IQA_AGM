@@ -315,10 +315,14 @@ def train(args):
     # ── Multi-layer fusion (optional) ────────────────────────────────────
     fusion = None
     if args.fusion_type != "none":
+        explicit_layers = None
+        if args.fusion_layers is not None:
+            explicit_layers = [int(x) for x in args.fusion_layers.split(",") if x.strip()]
         fusion = MultiLayerFusion.from_backbone(
             model,
             fusion_type=args.fusion_type,
             stride=args.fusion_stride,
+            layer_indices=explicit_layers,
             adaptive_conditioning=args.adaptive_conditioning,
             adaptive_norm=args.adaptive_norm,
         ).to(device).to(torch.bfloat16)
@@ -366,6 +370,8 @@ def train(args):
     best_eval_loss  = float("inf")
     patience_ctr    = 0
     best_SRCC       = float("-inf")
+    best_PLCC       = float("-inf")
+    best_epoch      = 0
     ckpt            = None
 
     if cfg["resume"] and os.path.exists(resume_path):
@@ -375,6 +381,8 @@ def train(args):
         start_epoch    = ckpt["epoch"]
         global_step    = ckpt["global_step"]
         best_SRCC      = ckpt.get("best_SRCC", best_SRCC)
+        best_PLCC      = ckpt.get("best_PLCC", best_PLCC)
+        best_epoch     = ckpt.get("best_epoch", best_epoch)
         print(f"Resuming from {resume_path} (epoch {start_epoch}, step {global_step})")
     else:
         print("Starting training from scratch.")
@@ -508,6 +516,7 @@ def train(args):
 
             # ── Evaluation ───────────────────────────────────────────────
             SRCC = float("-inf")
+            improved = False
             if cfg["do_eval"] and epoch % cfg["eval_epoch_steps"] == 0:
                 results, avg_eval = evaluate(
                     model, mlp, processor, eval_loader, device,
@@ -516,17 +525,22 @@ def train(args):
                 )
                 SRCC = results["SRCC"]
                 PLCC = results["PLCC"]
+                if SRCC > best_SRCC:
+                    best_SRCC, best_PLCC, best_epoch = SRCC, PLCC, epoch + 1
+                    improved = True
                 if accelerator.is_main_process:
-                    tqdm.write(f"  SRCC: {SRCC:.4f}  PLCC: {PLCC:.4f}  eval_loss: {avg_eval:.4f}")
+                    tqdm.write(f"  Epoch {epoch+1} — SRCC: {SRCC:.4f}  PLCC: {PLCC:.4f}  "
+                               f"eval_loss: {avg_eval:.4f}  | best SRCC: {best_SRCC:.4f} "
+                               f"(PLCC: {best_PLCC:.4f}) @ epoch {best_epoch}")
                     tracker.log({
                         f"{stage}_SRCC": SRCC,
                         f"{stage}_PLCC": PLCC,
                         f"{stage}_Avg_Eval_Loss": avg_eval,
+                        f"{stage}_best_SRCC": best_SRCC,
                     }, step=global_step)
 
             # ── Best checkpoint ───────────────────────────────────────────
-            if accelerator.is_main_process and SRCC > best_SRCC:
-                best_SRCC = SRCC
+            if accelerator.is_main_process and improved:
                 os.makedirs("best_checkpoints", exist_ok=True)
                 best_dir = f"best_checkpoints/{stage}_train_{train_db}_test_{eval_db}"
                 accelerator.unwrap_model(model).save_pretrained(best_dir)
@@ -548,6 +562,8 @@ def train(args):
                     "patience_counter":   patience_ctr,
                     "mlp_state_dict":     mlp.state_dict(),
                     "best_SRCC":          best_SRCC,
+                    "best_PLCC":          best_PLCC,
+                    "best_epoch":         best_epoch,
                     "fusion_state_dict":  (accelerator.unwrap_model(fusion).state_dict()
                                            if fusion is not None else None),
                 }, resume_path)
@@ -575,6 +591,9 @@ def train(args):
         os.makedirs("results", exist_ok=True)
         res_path = f"results/results_{stage}_Train_{train_db}_Test_{eval_db}.json"
         if cfg["do_eval"]:
+            results["best_SRCC"]  = float(best_SRCC)
+            results["best_PLCC"]  = float(best_PLCC)
+            results["best_epoch"] = int(best_epoch)
             with open(res_path, "w") as f:
                 json.dump(results, f, indent=4)
             print(f"Results saved to {res_path}")
@@ -614,6 +633,10 @@ def parse_args():
     p.add_argument("--fusion_stride", type=int, default=4,
                    help="Tap every Nth block, right-anchored on the last block "
                         "(stride=1 taps all layers). Resolved per-backbone from depth.")
+    p.add_argument("--fusion_layers", type=str, default=None,
+                   help="Explicit hidden_states block indices to tap, comma-separated "
+                        "(e.g. '3,7,11,27'; valid range 1..num_hidden_layers, 0 is the "
+                        "patch embedding). Overrides --fusion_stride when set.")
     p.add_argument("--adaptive_conditioning", type=str, default="static",
                    choices=["uniform", "static", "image"],
                    help="Adaptive weight source: 'uniform' (fixed 1/L baseline), "
@@ -631,7 +654,7 @@ def parse_args():
     p.add_argument("--lora_targets", type=str, default=None,
                    help="LoRA target projections on the vision tower, comma-separated "
                         "(e.g. 'q_proj,v_proj' or 'q_proj,k_proj,v_proj,out_proj'); "
-                        "or 'all-linear' for every Linear. Default: q_proj,v_proj.")
+                        "or 'all-linear' for every Linear. Default: q_proj,k_proj.")
 
     # Training
     p.add_argument("--epochs", type=int, default=TRAIN_CONFIG["epochs"])

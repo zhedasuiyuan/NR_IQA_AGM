@@ -13,6 +13,17 @@ backend is enough.
 
 from __future__ import annotations
 
+import os
+
+# Aim ships gRPC/protobuf-generated code built with an older protoc; on a newer
+# protobuf runtime importing it raises "Descriptors cannot be created directly".
+# Force protobuf's pure-Python backend (the documented workaround) before Aim is
+# imported. Must run before protobuf is first imported anywhere in the process;
+# tracker is imported early in train.py and Aim is imported lazily below, so this
+# is in time. Harmless for us: local Aim tracking doesn't use protobuf on its
+# hot path. setdefault respects an explicit override from the environment.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 from typing import Optional
 
 
