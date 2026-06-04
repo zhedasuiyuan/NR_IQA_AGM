@@ -1,6 +1,6 @@
 # Datasets (user-supplied, not tracked)
 Dataset/
-
+.claude/
 # Training outputs (pretrained_checkpoints/ is tracked — ships with the repo)
 checkpoints/
 best_checkpoints/

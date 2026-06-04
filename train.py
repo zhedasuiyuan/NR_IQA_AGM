@@ -537,6 +537,7 @@ def train(args):
                         f"{stage}_PLCC": PLCC,
                         f"{stage}_Avg_Eval_Loss": avg_eval,
                         f"{stage}_best_SRCC": best_SRCC,
+                        f"{stage}_best_PLCC": best_PLCC,
                     }, step=global_step)
 
             # ── Best checkpoint ───────────────────────────────────────────
