@@ -169,7 +169,7 @@ CLI flags (all on `train.py`):
 | Flag | Choices | Default | Meaning |
 |---|---|---|---|
 | `--fusion_type` | `none`, `mls`, `adaptive` | `none` | Fusion strategy (`none` = unchanged baseline) |
-| `--fusion_stride` | int ≥ 1 | `4` | Tap every Nth block (right-anchored; `1` = all) |
+| `--` | int ≥ 1 | `4` | Tap every Nth block (right-anchored; `1` = all) |
 | `--adaptive_conditioning` | `uniform`, `static`, `image` | `static` | How adaptive weights are produced |
 | `--adaptive_norm` | `softmax`, `sigmoid` | `softmax` | Adaptive weight normalisation |
 

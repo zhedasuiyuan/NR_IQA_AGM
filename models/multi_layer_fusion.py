@@ -98,6 +98,55 @@ def resolve_fusion_layers(num_hidden_layers: int, stride: int) -> List[int]:
     return idxs
 
 
+def resolve_layer_selection(
+    num_hidden_layers: int,
+    *,
+    stride: int = 4,
+    layer_indices: Optional[List[int]] = None,
+    first_n: Optional[int] = None,
+    last_n: Optional[int] = None,
+) -> List[int]:
+    """Resolve which ``hidden_states`` block indices (1..H) to tap.
+
+    At most one *override* may be set (they are mutually exclusive); otherwise
+    the right-anchored ``stride`` selection is used:
+
+      * ``layer_indices`` -- explicit block indices.
+      * ``first_n``       -- the first N blocks  : ``1 .. N``.
+      * ``last_n``        -- the last  N blocks  : ``H-N+1 .. H`` (H is the trunk source).
+
+    Index 0 (the patch embedding) is never selectable.
+    """
+    overrides = {k: v for k, v in (("layer_indices", layer_indices),
+                                   ("first_n", first_n), ("last_n", last_n))
+                 if v is not None}
+    if len(overrides) > 1:
+        raise ValueError(
+            f"Specify at most one of layer_indices/first_n/last_n; got {sorted(overrides)}."
+        )
+
+    if layer_indices is not None:
+        idxs = sorted(set(int(i) for i in layer_indices))
+    elif first_n is not None:
+        if not (1 <= first_n <= num_hidden_layers):
+            raise ValueError(f"first_n must be in 1..{num_hidden_layers}, got {first_n}.")
+        idxs = list(range(1, first_n + 1))
+    elif last_n is not None:
+        if not (1 <= last_n <= num_hidden_layers):
+            raise ValueError(f"last_n must be in 1..{num_hidden_layers}, got {last_n}.")
+        idxs = list(range(num_hidden_layers - last_n + 1, num_hidden_layers + 1))
+    else:
+        idxs = resolve_fusion_layers(num_hidden_layers, stride)
+
+    bad = [i for i in idxs if not (1 <= i <= num_hidden_layers)]
+    if bad:
+        raise ValueError(
+            f"fusion layer indices {bad} out of range; valid block indices are "
+            f"1..{num_hidden_layers} (index 0 is the patch embedding and is excluded)."
+        )
+    return idxs
+
+
 def extract_token_features(
     model: nn.Module, pixel_values: torch.Tensor, layer_indices: List[int]
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
@@ -278,21 +327,17 @@ class MultiLayerFusion(nn.Module):
 
     @classmethod
     def from_backbone(cls, model: nn.Module, *, fusion_type: str, stride: int = 4,
-                      layer_indices: Optional[List[int]] = None, **kwargs) -> "MultiLayerFusion":
-        """Build from a backbone. Layers are chosen either by ``stride`` (right-anchored
-        stride selection) or, when ``layer_indices`` is given, from those explicit
-        ``hidden_states`` block indices (1..num_hidden_layers; 0 is the patch embedding)."""
-        num_layers = backbone_num_hidden_layers(model)
-        if layer_indices is None:
-            layer_indices = resolve_fusion_layers(num_layers, stride)
-        else:
-            layer_indices = sorted(set(int(i) for i in layer_indices))
-            bad = [i for i in layer_indices if not (1 <= i <= num_layers)]
-            if bad:
-                raise ValueError(
-                    f"fusion layer indices {bad} out of range; valid block indices are "
-                    f"1..{num_layers} (index 0 is the patch embedding and is excluded)."
-                )
+                      layer_indices: Optional[List[int]] = None,
+                      first_n: Optional[int] = None, last_n: Optional[int] = None,
+                      **kwargs) -> "MultiLayerFusion":
+        """Build from a backbone. Layers are chosen by ``stride`` (right-anchored), or
+        by one of the mutually-exclusive overrides ``layer_indices`` / ``first_n`` /
+        ``last_n`` over the ``hidden_states`` block indices (1..num_hidden_layers;
+        index 0 is the patch embedding)."""
+        layer_indices = resolve_layer_selection(
+            backbone_num_hidden_layers(model),
+            stride=stride, layer_indices=layer_indices, first_n=first_n, last_n=last_n,
+        )
         return cls(
             fusion_type=fusion_type,
             layer_indices=layer_indices,

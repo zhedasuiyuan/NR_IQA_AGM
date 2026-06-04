@@ -323,6 +323,8 @@ def train(args):
             fusion_type=args.fusion_type,
             stride=args.fusion_stride,
             layer_indices=explicit_layers,
+            first_n=args.fusion_first_n,
+            last_n=args.fusion_last_n,
             adaptive_conditioning=args.adaptive_conditioning,
             adaptive_norm=args.adaptive_norm,
         ).to(device).to(torch.bfloat16)
@@ -638,6 +640,12 @@ def parse_args():
                    help="Explicit hidden_states block indices to tap, comma-separated "
                         "(e.g. '3,7,11,27'; valid range 1..num_hidden_layers, 0 is the "
                         "patch embedding). Overrides --fusion_stride when set.")
+    p.add_argument("--fusion_first_n", type=int, default=None,
+                   help="Tap the first N transformer blocks (hidden_states 1..N). Overrides "
+                        "--fusion_stride; mutually exclusive with --fusion_layers/--fusion_last_n.")
+    p.add_argument("--fusion_last_n", type=int, default=None,
+                   help="Tap the last N transformer blocks (hidden_states H-N+1..H). Overrides "
+                        "--fusion_stride; mutually exclusive with --fusion_layers/--fusion_first_n.")
     p.add_argument("--adaptive_conditioning", type=str, default="static",
                    choices=["uniform", "static", "image"],
                    help="Adaptive weight source: 'uniform' (fixed 1/L baseline), "
