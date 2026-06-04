@@ -131,9 +131,9 @@ class CLIVE(Dataset):
         if not os.path.exists(self.root):
             raise ValueError(f"Path {self.root} does not exist")
         
-        self.all_images = loadmat(os.path.join(self.root, 'Data/AllImages_release.mat'))['AllImages_release'] # [n][0][0]
-        self.all_mos = loadmat(os.path.join(self.root, 'Data/AllMOS_release.mat'))['AllMOS_release']
-        self.all_std = loadmat(os.path.join(self.root, 'Data/AllStdDev_release.mat'))['AllStdDev_release']
+        self.all_images = loadmat(os.path.join(self.root, 'Data/AllImages_release.mat'))['AllImages_release'][7:] # [n][0][0]
+        self.all_mos = loadmat(os.path.join(self.root, 'Data/AllMOS_release.mat'))['AllMOS_release'][:,7:]
+        self.all_std = loadmat(os.path.join(self.root, 'Data/AllStdDev_release.mat'))['AllStdDev_release'][:,7:]
 
         self.image_dir = [os.path.join(self.root, 'Images/', image[0][0]) for image in self.all_images]
         self.mos = [float(mos) for mos in self.all_mos[0]]
@@ -169,9 +169,9 @@ class CLIVE_inmemory(Dataset):
         if not os.path.exists(self.root):
             raise ValueError(f"Path {self.root} does not exist")
         
-        self.all_images = loadmat(os.path.join(self.root, 'Data/AllImages_release.mat'))['AllImages_release'] # [n][0][0]
-        self.all_mos = loadmat(os.path.join(self.root, 'Data/AllMOS_release.mat'))['AllMOS_release']
-        self.all_std = loadmat(os.path.join(self.root, 'Data/AllStdDev_release.mat'))['AllStdDev_release']
+        self.all_images = loadmat(os.path.join(self.root, 'Data/AllImages_release.mat'))['AllImages_release'][7:] # [n][0][0]
+        self.all_mos = loadmat(os.path.join(self.root, 'Data/AllMOS_release.mat'))['AllMOS_release'][:,7:]
+        self.all_std = loadmat(os.path.join(self.root, 'Data/AllStdDev_release.mat'))['AllStdDev_release'][:,7:]
 
         self.image_dir = [os.path.join(self.root, 'Images/', image[0][0]) for image in self.all_images]
         self.mos = [float(mos) for mos in self.all_mos[0]]
