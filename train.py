@@ -43,93 +43,20 @@ from peft import (
     get_peft_model,
 )
 from torch.optim.lr_scheduler import MultiStepLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 
 from tracker import Tracker
 
 from configs.default import MODEL_CONFIG, TRAIN_CONFIG, DATASET_PATHS, _make_dataset_paths
-from dataset import (
-    KonIQ_10K, KonIQ_10K_inmemory,
-    CLIVE, CLIVE_inmemory,
-    SPAQ, KADID10K, FLIVE,
-    AGIQA3K, AGIQA1K,
-)
+from dataset import build_splits
 from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion, extract_token_features, native_pool
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
 from seed import Seed, seed_worker
 from util import margin_loss, metric, Overlay, BAD_QUALITY_PROMPT, Text_Template_baseline
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
-
-
-# ---------------------------------------------------------------------------
-# Dataset builder
-# ---------------------------------------------------------------------------
-
-def build_datasets(dataset_id: str, paths: dict, seed: int):
-    """Return ``(train_dataset, eval_dataset)`` for the requested *dataset_id*.
-
-    Supports intra-dataset 80/20 splits as well as cross-dataset pairs
-    like ``KonIQ_10K_CLIVE`` (train on KonIQ, test on CLIVE).
-    """
-    gen = torch.Generator().manual_seed(seed)
-
-    if dataset_id == "CLIVE":
-        full = CLIVE_inmemory(path_to_db=paths["CLIVE"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "KonIQ_10K":
-        full = KonIQ_10K(path_to_db=paths["KonIQ_10K"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "KonIQ_10K_CLIVE":
-        train_ds = KonIQ_10K(path_to_db=paths["KonIQ_10K"])
-        eval_ds  = CLIVE_inmemory(path_to_db=paths["CLIVE"])
-        train_ds, _ = random_split(train_ds, [len(train_ds), 0], generator=gen)
-        eval_ds,  _ = random_split(eval_ds,  [len(eval_ds),  0], generator=gen)
-        return train_ds, eval_ds
-
-    if dataset_id == "CLIVE_KonIQ_10K":
-        train_ds = CLIVE_inmemory(path_to_db=paths["CLIVE"])
-        eval_ds  = KonIQ_10K(path_to_db=paths["KonIQ_10K"])
-        train_ds, _ = random_split(train_ds, [len(train_ds), 0], generator=gen)
-        eval_ds,  _ = random_split(eval_ds,  [len(eval_ds),  0], generator=gen)
-        return train_ds, eval_ds
-
-    if dataset_id == "SPAQ":
-        full = SPAQ(path_to_db=paths["SPAQ"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "KADID10K":
-        full = KADID10K(path_to_db=paths["KADID10K"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "FLIVE":
-        full = FLIVE(path_to_db=paths["FLIVE"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "AGIQA3K":
-        full = AGIQA3K(path_to_db=paths["AGIQA3K"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    if dataset_id == "AGIQA1K":
-        full = AGIQA1K(path_to_db=paths["AGIQA1K"])
-        t_len = int(0.8 * len(full))
-        return random_split(full, [t_len, len(full) - t_len], generator=gen)
-
-    raise ValueError(
-        f"Unknown dataset_id '{dataset_id}'. "
-        "Choose from: CLIVE, KonIQ_10K, SPAQ, KADID10K, FLIVE, "
-        "AGIQA3K, AGIQA1K, KonIQ_10K_CLIVE, CLIVE_KonIQ_10K"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +261,18 @@ def train(args):
               f"conditioning={args.adaptive_conditioning} norm={args.adaptive_norm}")
 
     # ── Dataset / DataLoader ─────────────────────────────────────────────
-    train_ds, eval_ds = build_datasets(args.dataset, dataset_paths, Seed)
+    # val drives best-checkpoint selection; test is held out for final reporting.
+    train_ds, val_ds, test_ds = build_splits(args.dataset, dataset_paths, Seed)
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
         drop_last=True, worker_init_fn=seed_worker,
     )
-    eval_loader = DataLoader(
-        eval_ds, batch_size=cfg["batch_size"], shuffle=False,
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg["batch_size"], shuffle=False,
+        drop_last=False, worker_init_fn=seed_worker,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=cfg["batch_size"], shuffle=False,
         drop_last=False, worker_init_fn=seed_worker,
     )
 
@@ -371,8 +303,10 @@ def train(args):
     start_epoch     = 0
     best_eval_loss  = float("inf")
     patience_ctr    = 0
-    best_SRCC       = float("-inf")
-    best_PLCC       = float("-inf")
+    best_val_SRCC   = float("-inf")
+    best_val_PLCC   = float("-inf")
+    best_test_SRCC  = float("-inf")
+    best_test_PLCC  = float("-inf")
     best_epoch      = 0
     ckpt            = None
 
@@ -382,8 +316,10 @@ def train(args):
         patience_ctr   = ckpt["patience_counter"]
         start_epoch    = ckpt["epoch"]
         global_step    = ckpt["global_step"]
-        best_SRCC      = ckpt.get("best_SRCC", best_SRCC)
-        best_PLCC      = ckpt.get("best_PLCC", best_PLCC)
+        best_val_SRCC  = ckpt.get("best_val_SRCC", best_val_SRCC)
+        best_val_PLCC  = ckpt.get("best_val_PLCC", best_val_PLCC)
+        best_test_SRCC = ckpt.get("best_test_SRCC", best_test_SRCC)
+        best_test_PLCC = ckpt.get("best_test_PLCC", best_test_PLCC)
         best_epoch     = ckpt.get("best_epoch", best_epoch)
         print(f"Resuming from {resume_path} (epoch {start_epoch}, step {global_step})")
     else:
@@ -427,7 +363,8 @@ def train(args):
     tracker.log_code(__file__)
 
     train_db = _db_name(train_loader)
-    eval_db  = _db_name(eval_loader)
+    val_db   = _db_name(val_loader)
+    test_db  = _db_name(test_loader)
     stage    = cfg["stage_name"]
 
     # ── Epoch loop ───────────────────────────────────────────────────────
@@ -491,7 +428,7 @@ def train(args):
                 # Periodic checkpoint
                 if global_step % cfg["checkpoint_steps"] == 0 and accelerator.is_main_process:
                     os.makedirs("checkpoints", exist_ok=True)
-                    ckpt_dir = f"checkpoints/{stage}_step_train_{train_db}_Test{eval_db}_{global_step}/"
+                    ckpt_dir = f"checkpoints/{stage}_step_train_{train_db}_Test{test_db}_{global_step}/"
                     accelerator.unwrap_model(model).save_pretrained(ckpt_dir)
                     torch.save(mlp.state_dict(), f"{ckpt_dir}/mlp.pt")
                     if fusion is not None:
@@ -516,41 +453,52 @@ def train(args):
             if cfg["lr_scheduler"]:
                 scheduler.step()
 
-            # ── Evaluation ───────────────────────────────────────────────
-            SRCC = float("-inf")
+            # ── Validation (drives best-checkpoint selection) ────────────
             improved = False
             if cfg["do_eval"] and epoch % cfg["eval_epoch_steps"] == 0:
-                results, avg_eval = evaluate(
-                    model, mlp, processor, eval_loader, device,
+                val_results, val_loss = evaluate(
+                    model, mlp, processor, val_loader, device,
                     dry_run=cfg["dry_run"],
                     fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
                 )
-                SRCC = results["SRCC"]
-                PLCC = results["PLCC"]
-                if SRCC > best_SRCC:
-                    best_SRCC, best_PLCC, best_epoch = SRCC, PLCC, epoch + 1
+                val_SRCC, val_PLCC = val_results["SRCC"], val_results["PLCC"]
+                if val_SRCC > best_val_SRCC:
+                    best_val_SRCC, best_val_PLCC, best_epoch = val_SRCC, val_PLCC, epoch + 1
                     improved = True
+                    # Test the just-selected model. Test never drives selection.
+                    test_results, _ = evaluate(
+                        model, mlp, processor, test_loader, device,
+                        dry_run=cfg["dry_run"],
+                        fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
+                    )
+                    best_test_SRCC, best_test_PLCC = test_results["SRCC"], test_results["PLCC"]
                 if accelerator.is_main_process:
-                    tqdm.write(f"  Epoch {epoch+1} — SRCC: {SRCC:.4f}  PLCC: {PLCC:.4f}  "
-                               f"eval_loss: {avg_eval:.4f}  | best SRCC: {best_SRCC:.4f} "
-                               f"(PLCC: {best_PLCC:.4f}) @ epoch {best_epoch}")
-                    tracker.log({
-                        f"{stage}_SRCC": SRCC,
-                        f"{stage}_PLCC": PLCC,
-                        f"{stage}_Avg_Eval_Loss": avg_eval,
-                        f"{stage}_best_SRCC": best_SRCC,
-                        f"{stage}_best_PLCC": best_PLCC,
-                    }, step=global_step)
+                    tqdm.write(f"  Epoch {epoch+1} — val SRCC: {val_SRCC:.4f}  val PLCC: {val_PLCC:.4f}  "
+                               f"val_loss: {val_loss:.4f}  | best val SRCC: {best_val_SRCC:.4f} "
+                               f"@ epoch {best_epoch}  (test SRCC: {best_test_SRCC:.4f} "
+                               f"PLCC: {best_test_PLCC:.4f})")
+                    log = {
+                        f"{stage}_val_SRCC": val_SRCC,
+                        f"{stage}_val_PLCC": val_PLCC,
+                        f"{stage}_val_loss": val_loss,
+                        f"{stage}_best_val_SRCC": best_val_SRCC,
+                        f"{stage}_best_val_PLCC": best_val_PLCC,
+                    }
+                    if improved:
+                        log[f"{stage}_test_SRCC"] = best_test_SRCC
+                        log[f"{stage}_test_PLCC"] = best_test_PLCC
+                    tracker.log(log, step=global_step)
 
-            # ── Best checkpoint ───────────────────────────────────────────
+            # ── Best checkpoint (selected on validation) ──────────────────
             if accelerator.is_main_process and improved:
                 os.makedirs("best_checkpoints", exist_ok=True)
-                best_dir = f"best_checkpoints/{stage}_train_{train_db}_test_{eval_db}"
+                best_dir = f"best_checkpoints/{stage}_train_{train_db}_test_{test_db}"
                 accelerator.unwrap_model(model).save_pretrained(best_dir)
                 torch.save(mlp.state_dict(), f"{best_dir}/mlp.pt")
                 if fusion is not None:
                     accelerator.unwrap_model(fusion).save(f"{best_dir}/fusion.pt")
-                tqdm.write(f"  [Best] SRCC={best_SRCC:.4f} saved to {best_dir}")
+                tqdm.write(f"  [Best] val SRCC={best_val_SRCC:.4f} "
+                           f"(test SRCC={best_test_SRCC:.4f}) saved to {best_dir}")
 
             # ── Resume state at epoch end ─────────────────────────────────
             if accelerator.is_main_process:
@@ -564,42 +512,42 @@ def train(args):
                     "best_eval_loss":     best_eval_loss,
                     "patience_counter":   patience_ctr,
                     "mlp_state_dict":     mlp.state_dict(),
-                    "best_SRCC":          best_SRCC,
-                    "best_PLCC":          best_PLCC,
+                    "best_val_SRCC":      best_val_SRCC,
+                    "best_val_PLCC":      best_val_PLCC,
+                    "best_test_SRCC":     best_test_SRCC,
+                    "best_test_PLCC":     best_test_PLCC,
                     "best_epoch":         best_epoch,
                     "fusion_state_dict":  (accelerator.unwrap_model(fusion).state_dict()
                                            if fusion is not None else None),
                 }, resume_path)
 
-    # ── Final evaluation ─────────────────────────────────────────────────
-    if cfg["do_eval"]:
-        print("Final evaluation ...")
-        results, avg_eval = evaluate(
-            model, mlp, processor, eval_loader, device, dry_run=cfg["dry_run"],
-            fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
-        )
-        print(f"  SRCC: {results['SRCC']:.4f}  PLCC: {results['PLCC']:.4f}  loss: {avg_eval:.4f}")
-        if accelerator.is_main_process:
-            tracker.log({f"{stage}_SRCC": results["SRCC"], f"{stage}_PLCC": results["PLCC"]}, step=global_step)
-
-    # ── Save final checkpoint ────────────────────────────────────────────
+    # ── Save final checkpoint + report the val-selected best ─────────────
     if accelerator.is_main_process:
         os.makedirs("checkpoints", exist_ok=True)
-        final_dir = f"checkpoints/{stage}_final_train_{train_db}_Test{eval_db}/"
+        final_dir = f"checkpoints/{stage}_final_train_{train_db}_Test{test_db}/"
         accelerator.unwrap_model(model).save_pretrained(final_dir)
         torch.save(mlp.state_dict(), f"{final_dir}/mlp.pt")
         if fusion is not None:
             accelerator.unwrap_model(fusion).save(f"{final_dir}/fusion.pt")
 
-        os.makedirs("results", exist_ok=True)
-        res_path = f"results/results_{stage}_Train_{train_db}_Test_{eval_db}.json"
         if cfg["do_eval"]:
-            results["best_SRCC"]  = float(best_SRCC)
-            results["best_PLCC"]  = float(best_PLCC)
-            results["best_epoch"] = int(best_epoch)
+            results = {
+                "dataset":    args.dataset,
+                "train_db":   train_db,
+                "val_db":     val_db,
+                "test_db":    test_db,
+                "best_epoch": int(best_epoch),
+                "val_SRCC":   float(best_val_SRCC),
+                "val_PLCC":   float(best_val_PLCC),
+                "test_SRCC":  float(best_test_SRCC),
+                "test_PLCC":  float(best_test_PLCC),
+            }
+            os.makedirs("results", exist_ok=True)
+            res_path = f"results/results_{stage}_Train_{train_db}_Test_{test_db}.json"
             with open(res_path, "w") as f:
                 json.dump(results, f, indent=4)
-            print(f"Results saved to {res_path}")
+            print(f"Results saved to {res_path}  (best epoch {best_epoch}: "
+                  f"val SRCC={best_val_SRCC:.4f}, test SRCC={best_test_SRCC:.4f})")
 
     tracker.finish()
 

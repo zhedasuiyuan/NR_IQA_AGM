@@ -38,6 +38,7 @@ from transformers import AutoModel, AutoProcessor
 from configs.default import MODEL_CONFIG, DATASET_PATHS, _make_dataset_paths
 from dataset import (
     KonIQ_10K, CLIVE_inmemory, SPAQ, KADID10K, FLIVE, AGIQA3K, AGIQA1K,
+    build_splits,
 )
 from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
@@ -50,9 +51,23 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 # Dataset builder (eval-only: returns the full dataset, no split)
 # ---------------------------------------------------------------------------
 
-def _load_eval_dataset(dataset_id: str, paths: dict):
-    """For cross-dataset ids like ``KonIQ_10K_CLIVE`` the *test* set is the
-    second part (CLIVE), matching the convention used during training."""
+def _load_eval_dataset(dataset_id: str, paths: dict,
+                       seed: int = 8, eval_split: str = "test"):
+    """Return the dataset partition to evaluate on.
+
+    ``test`` / ``val`` reproduce the exact held-out partition from training via
+    ``dataset.build_splits`` (within-dataset 60/20/20 with KADID grouped by
+    reference; cross-dataset = full target). ``full`` evaluates the entire target
+    dataset (legacy behaviour).
+    """
+    if eval_split in ("test", "val"):
+        _, val_ds, test_ds = build_splits(dataset_id, paths, seed)
+        chosen = test_ds if eval_split == "test" else val_ds
+        print(f"Eval split: {eval_split} via build_splits (seed={seed}) "
+              f"-> {len(chosen)} samples")
+        return chosen
+
+    # Legacy: the entire target dataset (cross-dataset ids resolve to the target).
     CROSS_DATASET_TEST = {
         "KonIQ_10K_CLIVE": "CLIVE",
         "CLIVE_KonIQ_10K": "KonIQ_10K",
@@ -180,7 +195,8 @@ def run_eval(args):
         print(f"Loaded multi-layer fusion: {fusion.config}")
 
     # ── Dataset ──────────────────────────────────────────────────────────
-    dataset = _load_eval_dataset(args.dataset, dataset_paths)
+    dataset = _load_eval_dataset(args.dataset, dataset_paths,
+                                 seed=args.seed, eval_split=args.eval_split)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     # ── Wrap for unified forward ─────────────────────────────────────────
@@ -305,6 +321,13 @@ def parse_args():
                    help="Path to save results JSON (default: results/eval_<stage>_<dataset>.json)")
     p.add_argument("--no_gradcam", action="store_true",
                    help="Skip GradCAM visualisation")
+    p.add_argument("--eval_split", type=str, default="test",
+                   choices=["test", "val", "full"],
+                   help="Partition to evaluate: 'test'/'val' reproduce the held-out "
+                        "build_splits partition (within-dataset 60/20/20, KADID grouped "
+                        "by reference; cross-dataset = full target); 'full' = entire target.")
+    p.add_argument("--seed", type=int, default=8,
+                   help="Seed for reproducing the train/val/test split (must match training).")
 
     return p.parse_args()
 

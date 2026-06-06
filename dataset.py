@@ -10,7 +10,7 @@ from PIL import Image
 import torch
 import numpy as np
 from scipy.io import loadmat
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset, random_split
 from tqdm import tqdm
 
 image_size = 512
@@ -490,10 +490,112 @@ class FLIVE(Dataset):
 
 #         return {'image': image, 'score': score}
 
+# ---------------------------------------------------------------------------
+# Train / val / test splitting (single source of truth, shared by train + eval)
+# ---------------------------------------------------------------------------
+
+# Within-dataset ids: construct one dataset, split it 60/20/20 (train/val/test).
+_DATASET_CTORS = {
+    "CLIVE":     lambda p: CLIVE_inmemory(path_to_db=p["CLIVE"]),
+    "KonIQ_10K": lambda p: KonIQ_10K(path_to_db=p["KonIQ_10K"]),
+    "SPAQ":      lambda p: SPAQ(path_to_db=p["SPAQ"]),
+    "KADID10K":  lambda p: KADID10K(path_to_db=p["KADID10K"]),
+    "FLIVE":     lambda p: FLIVE(path_to_db=p["FLIVE"]),
+    "AGIQA3K":   lambda p: AGIQA3K(path_to_db=p["AGIQA3K"]),
+    "AGIQA1K":   lambda p: AGIQA1K(path_to_db=p["AGIQA1K"]),
+}
+
+# Cross-dataset ids: (train_db, test_db). Source is split 80/20 train/val; the
+# full target dataset is the test set.
+_CROSS_DATASETS = {
+    "KonIQ_10K_CLIVE": ("KonIQ_10K", "CLIVE"),
+    "CLIVE_KonIQ_10K": ("CLIVE", "KonIQ_10K"),
+}
+
+# Synthetic-distortion datasets where many distorted images share one reference
+# image: these must be split *by reference* so a scene never straddles the
+# train/val/test boundary (random splitting on distorted images leaks content).
+_REFERENCE_GROUPED = {"KADID10K"}
+
+
+def _reference_keys(dataset) -> list:
+    """Per-item reference-image key for a synthetic-distortion dataset.
+
+    Uses the ``ref_img`` column when present (KADID's dmos.csv), else derives the
+    reference id from the distorted filename prefix (``I01_03_05.png`` -> ``I01``).
+    """
+    df = dataset.data
+    if "ref_img" in df.columns:
+        return list(df["ref_img"])
+    return [str(name).split("_")[0] for name in df["dist_img"]]
+
+
+def _grouped_split(groups, fractions, seed):
+    """Partition item indices into ``len(fractions)`` splits *by group*, so every
+    item sharing a group key lands in the same split. Unique groups are shuffled
+    (seeded) and assigned to splits by cumulative fraction of the group count."""
+    g2items: dict = {}
+    for i, g in enumerate(groups):
+        g2items.setdefault(g, []).append(i)
+    keys = list(g2items.keys())
+    perm = np.random.default_rng(seed).permutation(len(keys))
+    keys = [keys[i] for i in perm]
+
+    n_groups = len(keys)
+    bounds = [int(round(c * n_groups)) for c in np.cumsum(fractions)]
+    bounds[-1] = n_groups
+    splits, start = [], 0
+    for b in bounds:
+        splits.append([i for g in keys[start:b] for i in g2items[g]])
+        start = b
+    return splits
+
+
+def build_splits(dataset_id: str, paths: dict, seed: int):
+    """Return ``(train_ds, val_ds, test_ds)`` for *dataset_id*.
+
+    * Within-dataset ids (CLIVE, KonIQ_10K, ...): a deterministic **60/20/20**
+      train/val/test split of that dataset (KADID is split *by reference image*).
+    * Cross-dataset ids (e.g. ``CLIVE_KonIQ_10K`` = train CLIVE, test KonIQ): the
+      source dataset is split **80/20** into train/val and the **full target**
+      dataset is the test set.
+
+    Shared by ``train.py`` (which selects on ``val_ds``) and the eval scripts
+    (which re-create the identical ``test_ds``), so the partitions always agree.
+    """
+    gen = torch.Generator().manual_seed(seed)
+
+    if dataset_id in _CROSS_DATASETS:
+        train_db, test_db = _CROSS_DATASETS[dataset_id]
+        source = _DATASET_CTORS[train_db](paths)
+        tr = int(0.8 * len(source))
+        train_ds, val_ds = random_split(source, [tr, len(source) - tr], generator=gen)
+        test_ds = _DATASET_CTORS[test_db](paths)
+        return train_ds, val_ds, test_ds
+
+    if dataset_id in _DATASET_CTORS:
+        full = _DATASET_CTORS[dataset_id](paths)
+        if dataset_id in _REFERENCE_GROUPED:
+            idx_tr, idx_va, idx_te = _grouped_split(
+                _reference_keys(full), [0.6, 0.2, 0.2], seed
+            )
+            return Subset(full, idx_tr), Subset(full, idx_va), Subset(full, idx_te)
+        n = len(full)
+        tr = int(0.6 * n)
+        va = int(0.2 * n)
+        te = n - tr - va
+        return random_split(full, [tr, va, te], generator=gen)
+
+    raise ValueError(
+        f"Unknown dataset_id '{dataset_id}'. Choose from: "
+        f"{', '.join(_DATASET_CTORS)} or cross-dataset: {', '.join(_CROSS_DATASETS)}"
+    )
+
+
 def main():
     flive = FLIVE('./Dataset/FLIVE/database')
     print(flive.__len__())
-    print(flive.__getitem__(0))   
+    print(flive.__getitem__(0))
 
 
 if __name__ == '__main__':

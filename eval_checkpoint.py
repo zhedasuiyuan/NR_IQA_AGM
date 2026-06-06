@@ -38,6 +38,7 @@ from transformers import AutoModel, AutoProcessor
 from configs.default import MODEL_CONFIG, _make_dataset_paths
 from dataset import (
     KonIQ_10K, CLIVE_inmemory, SPAQ, KADID10K, FLIVE, AGIQA3K, AGIQA1K,
+    build_splits,
 )
 from models import MLP3_Gated, mlp_3_layer, mlp_3_layer_sigmoid_siglip, SIGLIPWithMLP, MultiLayerFusion
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
@@ -133,7 +134,7 @@ CHECKPOINT_REGISTRY = {
     },
 }
 
-EVAL_SPLIT_CHOICES = ("full", "val_80_20")
+EVAL_SPLIT_CHOICES = ("test", "val", "full", "val_80_20")
 
 
 def _eval_mode_str(entry: dict) -> str:
@@ -230,16 +231,26 @@ def build_mlp(arch: str, input_dim: int = 1152, hidden: int = 512,
 # ╰──────────────────────────────────────────────────────────────────────╯
 
 def _load_eval_dataset(dataset_id: str, paths: dict,
-                       seed: int = 8, eval_split: str = "full"):
+                       seed: int = 8, eval_split: str = "test"):
     """Build the eval dataset, replicating the training-time split.
 
-    For within-dataset runs (CLIVE/KonIQ/etc.), the training script does an
-    80/20 random_split seeded by ``seed`` and uses the 20% partition as the
-    eval set. Pass ``eval_split="val_80_20"`` to reproduce that protocol.
+    Current protocol (``eval_split="test"`` / ``"val"``): reproduce the exact
+    held-out partition from ``dataset.build_splits`` — within-dataset 60/20/20
+    (KADID split *by reference image*), cross-dataset = full target dataset.
 
-    For cross-dataset runs (KonIQ_10K_CLIVE etc.), the training script
-    evaluates on the full target dataset; pass ``eval_split="full"``.
+    Legacy protocol (for checkpoints trained under the old 80/20 scheme):
+    ``"val_80_20"`` reproduces the 20% held-out partition; ``"full"`` is the
+    entire target dataset.
     """
+    # ── Current protocol: identical partitions to train.py via build_splits ──
+    if eval_split in ("test", "val"):
+        _, val_ds, test_ds = build_splits(dataset_id, paths, seed)
+        chosen = test_ds if eval_split == "test" else val_ds
+        print(f"Eval split: {eval_split} via build_splits (seed={seed}) "
+              f"-> {len(chosen)} samples")
+        return chosen
+
+    # ── Legacy modes ─────────────────────────────────────────────────────────
     CROSS_DATASET_TEST = {
         "KonIQ_10K_CLIVE": "CLIVE",
         "CLIVE_KonIQ_10K": "KonIQ_10K",
@@ -460,9 +471,13 @@ def main():
     parser.add_argument(
         "--eval_split", type=str, default=None, choices=EVAL_SPLIT_CHOICES,
         help="Which subset of the dataset to evaluate on.\n"
-             "  val_80_20 = 20%% held-out partition (requires --seed)\n"
-             "  full      = the entire target dataset (cross-dataset evals)\n"
-             "If --run is set, defaults to the registry's value; otherwise val_80_20.",
+             "  test      = held-out test set from build_splits (current protocol:\n"
+             "              within-dataset 60/20/20, KADID grouped by reference;\n"
+             "              cross-dataset = full target)\n"
+             "  val       = validation partition from build_splits\n"
+             "  val_80_20 = legacy 20%% held-out partition (old 80/20 checkpoints)\n"
+             "  full      = the entire target dataset\n"
+             "If --run is set, defaults to the registry's value; otherwise test.",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -511,12 +526,12 @@ def main():
         ckpt_dir   = args.checkpoint
         arch       = args.arch
         dataset_id = args.dataset
-        eval_split = args.eval_split or "val_80_20"
+        eval_split = args.eval_split or "test"
         if eval_split == "val_80_20" and args.seed is None:
             parser.error(
                 "--seed is required when --eval_split=val_80_20 "
                 "(use the seed that was used for the training-time random_split, "
-                "or pass --eval_split=full to evaluate on the entire dataset)."
+                "or pass --eval_split=test to evaluate on the held-out test set)."
             )
         seed = args.seed if args.seed is not None else 8
 
