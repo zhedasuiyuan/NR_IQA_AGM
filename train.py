@@ -80,6 +80,29 @@ def _db_name(loader):
     return getattr(ds, "db_name", "unknown")
 
 
+def _fusion_diagnostics(fusion_module, layer_indices):
+    """Per-epoch fusion internals for tracking (gate trajectory, layer weights).
+
+    Confirms whether a step-0-identical fusion actually turns on: if
+    ``fusion/gate`` (adaptive) or ``fusion/out_proj_norm`` (cross_attention)
+    stays ~0, the residual is switched off and the fusion is a no-op.
+    """
+    if fusion_module is None:
+        return {}
+    f = fusion_module.fuser
+    diags = {}
+    if hasattr(f, "gate"):                                  # adaptive
+        diags["fusion/gate"] = f.gate.detach().float().mean().item()
+    if getattr(f, "alpha", None) is not None:               # adaptive 'static'
+        w = (torch.softmax(f.alpha.detach().float(), dim=-1) if f.norm == "softmax"
+             else torch.sigmoid(f.alpha.detach().float()))
+        for idx, wl in zip(layer_indices, w.tolist()):
+            diags[f"fusion/w_layer{idx}"] = wl
+    if hasattr(f, "out_proj"):                              # cross_attention
+        diags["fusion/out_proj_norm"] = f.out_proj.weight.detach().float().norm().item()
+    return diags
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -254,11 +277,16 @@ def train(args):
             last_n=args.fusion_last_n,
             adaptive_conditioning=args.adaptive_conditioning,
             adaptive_norm=args.adaptive_norm,
+            fusion_num_heads=args.fusion_num_heads,
+            fusion_gate_init=args.fusion_gate_init,
+            dropout=args.fusion_dropout,
         ).to(device).to(torch.bfloat16)
         fusion.requires_grad_(True)
         print(f"Multi-layer fusion: type={args.fusion_type} "
               f"layers(hidden_states idx)={fusion.layer_indices} "
-              f"conditioning={args.adaptive_conditioning} norm={args.adaptive_norm}")
+              f"conditioning={args.adaptive_conditioning} norm={args.adaptive_norm} "
+              f"num_heads={args.fusion_num_heads} dropout={args.fusion_dropout} "
+              f"gate_init={args.fusion_gate_init}")
 
     # ── Dataset / DataLoader ─────────────────────────────────────────────
     # val drives best-checkpoint selection; test is held out for final reporting.
@@ -487,6 +515,9 @@ def train(args):
                     if improved:
                         log[f"{stage}_test_SRCC"] = best_test_SRCC
                         log[f"{stage}_test_PLCC"] = best_test_PLCC
+                    if fusion is not None:
+                        log.update(_fusion_diagnostics(
+                            accelerator.unwrap_model(fusion), fusion_layer_indices))
                     tracker.log(log, step=global_step)
 
             # ── Best checkpoint (selected on validation) ──────────────────
@@ -576,11 +607,13 @@ def parse_args():
 
     # Multi-layer fusion
     p.add_argument("--fusion_type", type=str, default="none",
-                   choices=["none", "mls", "adaptive"],
+                   choices=["none", "mls", "adaptive", "cross_attention"],
                    help="Multi-layer feature fusion before the MLP head. "
                         "'none' = vanilla single-layer get_image_features; "
                         "'mls' = RAE-V2 multi-layer sum (hard replace); "
-                        "'adaptive' = learned weighted residual (step-0 identical).")
+                        "'adaptive' = learned weighted residual (step-0 identical); "
+                        "'cross_attention' = trunk queries the tapped layers' tokens, "
+                        "residual via zero-init out_proj (step-0 identical).")
     p.add_argument("--fusion_stride", type=int, default=4,
                    help="Tap every Nth block, right-anchored on the last block "
                         "(stride=1 taps all layers). Resolved per-backbone from depth.")
@@ -601,6 +634,17 @@ def parse_args():
     p.add_argument("--adaptive_norm", type=str, default="softmax",
                    choices=["softmax", "sigmoid"],
                    help="Adaptive weight normalisation.")
+    p.add_argument("--fusion_num_heads", type=int, default=8,
+                   help="Number of heads for --fusion_type cross_attention "
+                        "(must divide the backbone hidden size).")
+    p.add_argument("--fusion_dropout", type=float, default=0.0,
+                   help="Dropout inside the fusion module (cross_attention / "
+                        "adaptive image conditioning).")
+    p.add_argument("--fusion_gate_init", type=float, default=0.0,
+                   help="Warm-start the fusion residual. 0.0 = step-0 identical (residual "
+                        "off); a small positive value (e.g. 0.1) turns it on at init so the "
+                        "fusion isn't born switched off. Applies to adaptive (gate value) "
+                        "and cross_attention (out_proj init scale).")
 
     # PEFT
     p.add_argument("--peft_method", type=str, default=TRAIN_CONFIG["peft_method"],

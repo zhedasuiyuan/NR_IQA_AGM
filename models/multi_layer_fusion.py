@@ -220,6 +220,7 @@ class TokenAdaptiveFusion(nn.Module):
         conditioning: str = "static",
         norm: str = "softmax",
         dropout: float = 0.0,
+        gate_init: float = 0.0,
     ):
         super().__init__()
         if conditioning not in _VALID_CONDITIONING:
@@ -232,7 +233,10 @@ class TokenAdaptiveFusion(nn.Module):
         self.norm = norm
 
         self.layer_norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
-        self.gate = nn.Parameter(torch.zeros(1))
+        # gate_init=0.0 -> step-0 identical (residual off); a small positive value
+        # (e.g. 0.1) warm-starts the residual so the gate and the per-layer
+        # weights/LNs receive gradient instead of staying switched off.
+        self.gate = nn.Parameter(torch.full((1,), gate_init))
 
         if conditioning == "uniform":
             self.register_buffer("uniform_w", torch.full((num_layers,), 1.0 / num_layers))
@@ -277,6 +281,62 @@ class TokenAdaptiveFusion(nn.Module):
         return trunk + self.gate.to(trunk.dtype) * weighted.to(trunk.dtype)
 
 
+class TokenCrossAttentionFusion(nn.Module):
+    """Cross-attention multi-layer fusion (ported from VisualQuality-R1's
+    ``CrossAttentionFusion`` in ``dual_encoder/fusion_block.py``).
+
+    The trunk (post-LN ``last_hidden_state``) is the **query**; the tapped
+    layers' tokens, concatenated along the sequence axis, are the **key/value**.
+    The attended result is added back to the trunk through an ``out_proj``
+    residual. With ``gate_init=0.0`` the ``out_proj`` is zero-initialised, so at
+    step 0 the fused output equals the trunk (identical to
+    ``get_image_features``); a small positive ``gate_init`` warm-starts the
+    residual (its weights are initialised with std ``gate_init / sqrt(dim)``) so
+    the block is not born switched off.
+
+    Memory note: the key/value length is ``num_layers * N`` tokens, so attention
+    is ``O(N * num_layers * N)``. Reduce the number of tapped layers
+    (``--fusion_stride`` / ``--fusion_first_n`` / ``--fusion_last_n``) if memory
+    is tight.
+    """
+
+    def __init__(self, num_layers: int, dim: int, num_heads: int = 8,
+                 dropout: float = 0.0, gate_init: float = 0.0):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_size {dim} is not divisible by fusion_num_heads {num_heads}."
+            )
+        self.num_layers = num_layers
+        self.q_norm = nn.LayerNorm(dim)
+        self.kv_norm = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout
+        )
+        self.out_norm = nn.LayerNorm(dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop = nn.Dropout(dropout)
+        # Residual projection. gate_init=0 -> zero-init -> step-0 no-op; >0 ->
+        # warm-start the residual at relative magnitude ~gate_init.
+        nn.init.zeros_(self.out_proj.bias)
+        if gate_init == 0.0:
+            nn.init.zeros_(self.out_proj.weight)
+        else:
+            nn.init.normal_(self.out_proj.weight, std=gate_init * dim ** -0.5)
+
+    def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
+        if len(layer_features) != self.num_layers:
+            raise ValueError(f"expected {self.num_layers} layers, got {len(layer_features)}")
+        kv = self.kv_norm(torch.cat(layer_features, dim=1))   # [B, L*N, D]
+        q = self.q_proj(self.q_norm(trunk))                   # [B, N, D]
+        attn_out, _ = self.attn(query=q, key=self.k_proj(kv), value=self.v_proj(kv))
+        fused = self.out_proj(self.out_norm(attn_out))
+        return trunk + self.drop(fused).to(trunk.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Container: holds the fusion module + the resolved layer indices, with
 # self-describing save/load so eval can rebuild without CLI flags.
@@ -298,6 +358,8 @@ class MultiLayerFusion(nn.Module):
         hidden_size: int,
         adaptive_conditioning: str = "static",
         adaptive_norm: str = "softmax",
+        fusion_num_heads: int = 8,
+        fusion_gate_init: float = 0.0,
         dropout: float = 0.0,
     ):
         super().__init__()
@@ -311,9 +373,18 @@ class MultiLayerFusion(nn.Module):
             self.fuser = TokenAdaptiveFusion(
                 num_layers=L, dim=hidden_size,
                 conditioning=adaptive_conditioning, norm=adaptive_norm, dropout=dropout,
+                gate_init=fusion_gate_init,
+            )
+        elif fusion_type == "cross_attention":
+            self.fuser = TokenCrossAttentionFusion(
+                num_layers=L, dim=hidden_size,
+                num_heads=fusion_num_heads, dropout=dropout, gate_init=fusion_gate_init,
             )
         else:
-            raise ValueError(f"fusion_type='{fusion_type}' invalid; expected 'mls' or 'adaptive'")
+            raise ValueError(
+                f"fusion_type='{fusion_type}' invalid; expected "
+                "'mls', 'adaptive', or 'cross_attention'"
+            )
 
         # Self-describing config for checkpoint round-trips.
         self.config = dict(
@@ -322,6 +393,8 @@ class MultiLayerFusion(nn.Module):
             hidden_size=hidden_size,
             adaptive_conditioning=adaptive_conditioning,
             adaptive_norm=adaptive_norm,
+            fusion_num_heads=fusion_num_heads,
+            fusion_gate_init=fusion_gate_init,
             dropout=dropout,
         )
 
