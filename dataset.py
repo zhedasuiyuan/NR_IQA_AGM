@@ -510,6 +510,8 @@ _DATASET_CTORS = {
 _CROSS_DATASETS = {
     "KonIQ_10K_CLIVE": ("KonIQ_10K", "CLIVE"),
     "CLIVE_KonIQ_10K": ("CLIVE", "KonIQ_10K"),
+    "FLIVE_CLIVE": ("FLIVE", "CLIVE"),
+    "FLIVE_KonIQ_10K": ("FLIVE", "KonIQ_10K")
 }
 
 # Synthetic-distortion datasets where many distorted images share one reference
