@@ -6,3 +6,9 @@ from .multi_layer_fusion import (
     extract_token_features,
     native_pool,
 )
+from .dual_encoder_fusion import (
+    DualEncoderFusion,
+    extract_trunk,
+    extract_aux_tokens,
+    aux_hidden_size,
+)

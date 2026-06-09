@@ -205,6 +205,30 @@ class TokenMLSFusion(nn.Module):
         return normed.mean(dim=0).to(trunk.dtype)
 
 
+class TokenSoftMLSFusion(nn.Module):
+    """Soft (residual) multi-layer sum: ``out = trunk + alpha * mean_l RMSNorm(F_l)``.
+
+    Unlike :class:`TokenMLSFusion` (which *hard-replaces* the trunk with the
+    multi-scale mean), this **keeps the pooler-aligned trunk** and adds the mean
+    as a learnable-strength residual -- aiming to retain MLS's cross-dataset gain
+    without the within-dataset cost of discarding the trunk.
+
+    The mean is parameter-free, so the only learnable parameter is the scalar
+    ``gate`` (=alpha), initialised to ``gate_init`` (0.0 -> step-0 identical).
+    Because nothing learnable is gated *behind* ``gate``, its gradient
+    (``<dL/dout, MLS>``) is not starved: it grows iff the multi-scale mean
+    reduces the loss. A 'safe' fusion that learns exactly how much to use.
+    """
+
+    def __init__(self, gate_init: float = 0.0):
+        super().__init__()
+        self.gate = nn.Parameter(torch.full((1,), gate_init))
+
+    def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
+        mls = torch.stack([_rms_norm(f) for f in layer_features], dim=0).mean(dim=0)
+        return trunk + self.gate.to(trunk.dtype) * mls.to(trunk.dtype)
+
+
 class TokenAdaptiveFusion(nn.Module):
     """Learned weighted-residual aggregation at the token level.
 
@@ -369,6 +393,8 @@ class MultiLayerFusion(nn.Module):
 
         if fusion_type == "mls":
             self.fuser: nn.Module = TokenMLSFusion()
+        elif fusion_type == "soft_mls":
+            self.fuser = TokenSoftMLSFusion(gate_init=fusion_gate_init)
         elif fusion_type == "adaptive":
             self.fuser = TokenAdaptiveFusion(
                 num_layers=L, dim=hidden_size,
@@ -383,7 +409,7 @@ class MultiLayerFusion(nn.Module):
         else:
             raise ValueError(
                 f"fusion_type='{fusion_type}' invalid; expected "
-                "'mls', 'adaptive', or 'cross_attention'"
+                "'mls', 'soft_mls', 'adaptive', or 'cross_attention'"
             )
 
         # Self-describing config for checkpoint round-trips.

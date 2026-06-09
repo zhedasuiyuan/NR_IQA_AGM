@@ -45,13 +45,14 @@ from peft import (
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoImageProcessor, AutoModel, AutoProcessor
 
 from tracker import Tracker
 
 from configs.default import MODEL_CONFIG, TRAIN_CONFIG, DATASET_PATHS, _make_dataset_paths
 from dataset import build_splits
 from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion, extract_token_features, native_pool
+from models import DualEncoderFusion, extract_trunk, extract_aux_tokens, aux_hidden_size
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
 from seed import Seed, seed_worker
 from util import margin_loss, metric, Overlay, BAD_QUALITY_PROMPT, Text_Template_baseline
@@ -108,23 +109,42 @@ def _fusion_diagnostics(fusion_module, layer_indices):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusion=None):
+def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusion=None,
+            aux_model=None, aux_processor=None, dual_fusion=None):
     """Run inference on *dataloader_eval* and return (results_dict, avg_loss).
 
-    The model and MLP are deep-copied so evaluation doesn't affect the
-    training-mode state.
+    The model, MLP and (optional) fusion are deep-copied so evaluation doesn't
+    affect the training-mode state. The frozen ``aux_model`` (dual-encoder mode)
+    is used as-is. Prediction is dispatched through a ``predict`` closure so the
+    non-dual path keeps the exact ``SIGLIPWithMLP`` behaviour.
     """
     model_copy = copy.deepcopy(model)
     mlp_copy   = copy.deepcopy(mlp)
-    fusion_copy = copy.deepcopy(fusion) if fusion is not None else None
-
     base = model_copy.module if hasattr(model_copy, "module") else model_copy
-    combined = SIGLIPWithMLP(
-        base_model=base.float(),
-        mlp_head=mlp_copy.float(),
-        device=device,
-        fusion=(fusion_copy.float() if fusion_copy is not None else None),
-    ).to(device).eval()
+    base = base.float()
+    mlp_f = mlp_copy.float()
+
+    if dual_fusion is not None:
+        dfz = copy.deepcopy(dual_fusion).float().to(device).eval()
+        base = base.to(device).eval()
+        mlp_f = mlp_f.to(device).eval()
+
+        def predict(images):
+            inputs     = processor(images=images, return_tensors="pt").to(device)
+            aux_inputs = aux_processor(images=images, return_tensors="pt").to(device)
+            trunk      = extract_trunk(base, inputs["pixel_values"])
+            aux_tokens = extract_aux_tokens(aux_model, aux_inputs["pixel_values"])
+            feats      = native_pool(base, dfz(trunk, aux_tokens))
+            return mlp_f(feats).squeeze(1)
+    else:
+        fusion_copy = copy.deepcopy(fusion).float() if fusion is not None else None
+        combined = SIGLIPWithMLP(
+            base_model=base, mlp_head=mlp_f, device=device, fusion=fusion_copy,
+        ).to(device).eval()
+
+        def predict(images):
+            inputs = processor(images=images, return_tensors="pt").to(device)
+            return combined(inputs["pixel_values"])
 
     all_preds, all_labels = [], []
     total_loss, n_batches = 0.0, 0
@@ -139,8 +159,7 @@ def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusi
 
             images   = batch["image"].to(device)
             gt       = batch["score"].to(device)
-            inputs   = processor(images=images, return_tensors="pt").to(device)
-            preds    = combined(inputs["pixel_values"])
+            preds    = predict(images)
 
             loss_mse = torch.nn.functional.mse_loss(preds, gt)
             loss_mrg = margin_loss(gt, preds)
@@ -161,7 +180,7 @@ def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusi
     results  = dict(m.result)
     results["avg_eval_loss"] = float(avg_loss)
 
-    del combined, model_copy, mlp_copy
+    del model_copy, mlp_copy
     torch.cuda.empty_cache()
     return results, avg_loss
 
@@ -288,6 +307,46 @@ def train(args):
               f"num_heads={args.fusion_num_heads} dropout={args.fusion_dropout} "
               f"gate_init={args.fusion_gate_init}")
 
+    # ── Dual-encoder cross-attention fusion (optional) ───────────────────
+    # A frozen auxiliary encoder (e.g. DINOv2/DINOv3) provides key/value tokens;
+    # the SigLIP trunk queries them. Enabled by --aux_model_id (HF id or a local
+    # directory, e.g. DINOv3 from disk). Mutually exclusive with --fusion_type.
+    aux_model = aux_processor = dual_fusion = None
+    if args.aux_model_id is not None:
+        if args.fusion_type != "none":
+            raise ValueError(
+                "--aux_model_id (dual encoder) and --fusion_type (intra-encoder "
+                "multi-layer fusion) are mutually exclusive; enable one at a time."
+            )
+        print(f"Dual encoder: loading frozen aux backbone '{args.aux_model_id}' ...")
+        aux_model = AutoModel.from_pretrained(
+            args.aux_model_id, torch_dtype=torch.bfloat16,
+            trust_remote_code=args.aux_trust_remote_code,
+        ).to(device)
+        aux_model.requires_grad_(False)
+        aux_model.eval()
+
+        proc_id = args.aux_processor_id or args.aux_model_id
+        try:
+            aux_processor = AutoProcessor.from_pretrained(
+                proc_id, trust_remote_code=args.aux_trust_remote_code)
+        except Exception:
+            aux_processor = AutoImageProcessor.from_pretrained(
+                proc_id, trust_remote_code=args.aux_trust_remote_code)
+
+        dual_fusion = DualEncoderFusion(
+            q_dim=args.mlp_input_dim,
+            kv_dim=aux_hidden_size(aux_model),
+            aux_model_id=args.aux_model_id,
+            num_heads=args.aux_num_heads,
+            dropout=args.aux_dropout,
+            gate_init=args.aux_gate_init,
+        ).to(device).to(torch.bfloat16)
+        dual_fusion.requires_grad_(True)
+        print(f"Dual encoder: q_dim={args.mlp_input_dim} "
+              f"kv_dim={aux_hidden_size(aux_model)} num_heads={args.aux_num_heads} "
+              f"dropout={args.aux_dropout} gate_init={args.aux_gate_init}")
+
     # ── Dataset / DataLoader ─────────────────────────────────────────────
     # val drives best-checkpoint selection; test is held out for final reporting.
     train_ds, val_ds, test_ds = build_splits(args.dataset, dataset_paths, Seed)
@@ -311,6 +370,8 @@ def train(args):
     head_params = list(mlp.parameters())
     if fusion is not None:
         head_params += list(fusion.parameters())
+    if dual_fusion is not None:
+        head_params += list(dual_fusion.parameters())
     optimizer = torch.optim.Adam(
         [
             {"params": list(model.parameters()), "lr": cfg["backbone_lr"]},
@@ -357,15 +418,22 @@ def train(args):
     mlp.train()
     if fusion is not None:
         fusion.train()
+    if dual_fusion is not None:
+        dual_fusion.train()
 
     # The tapped indices are needed in the training loop; capture them before
     # `prepare` wraps `fusion` (the wrapper hides plain attributes).
     fusion_layer_indices = fusion.layer_indices if fusion is not None else None
 
     # ── Accelerator prepare ──────────────────────────────────────────────
+    # fusion and dual_fusion are mutually exclusive (enforced at build time).
     if fusion is not None:
         model, mlp, fusion, optimizer, scheduler, train_loader = accelerator.prepare(
             model, mlp, fusion, optimizer, scheduler, train_loader,
+        )
+    elif dual_fusion is not None:
+        model, mlp, dual_fusion, optimizer, scheduler, train_loader = accelerator.prepare(
+            model, mlp, dual_fusion, optimizer, scheduler, train_loader,
         )
     else:
         model, mlp, optimizer, scheduler, train_loader = accelerator.prepare(
@@ -379,6 +447,8 @@ def train(args):
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if fusion is not None and ckpt.get("fusion_state_dict") is not None:
             accelerator.unwrap_model(fusion).load_state_dict(ckpt["fusion_state_dict"])
+        if dual_fusion is not None and ckpt.get("dual_fusion_state_dict") is not None:
+            accelerator.unwrap_model(dual_fusion).load_state_dict(ckpt["dual_fusion_state_dict"])
 
     # ── Experiment tracker (Aim by default) ──────────────────────────────
     tracker = Tracker(
@@ -394,6 +464,15 @@ def train(args):
     val_db   = _db_name(val_loader)
     test_db  = _db_name(test_loader)
     stage    = cfg["stage_name"]
+
+    def _eval(loader):
+        return evaluate(
+            model, mlp, processor, loader, device, dry_run=cfg["dry_run"],
+            fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
+            aux_model=aux_model, aux_processor=aux_processor,
+            dual_fusion=(accelerator.unwrap_model(dual_fusion)
+                         if dual_fusion is not None else None),
+        )
 
     # ── Epoch loop ───────────────────────────────────────────────────────
     for epoch in tqdm(range(start_epoch, cfg["epochs"]), desc="Epochs",
@@ -413,7 +492,13 @@ def train(args):
                 images = batch["image"].to(device)
                 inputs = processor(images=images, return_tensors="pt").to(model.device)
 
-                if fusion is not None:
+                if dual_fusion is not None:
+                    aux_inputs = aux_processor(images=images, return_tensors="pt").to(device)
+                    trunk = extract_trunk(model, inputs["pixel_values"])
+                    with torch.no_grad():
+                        aux_tokens = extract_aux_tokens(aux_model, aux_inputs["pixel_values"])
+                    features = native_pool(model, dual_fusion(trunk, aux_tokens))
+                elif fusion is not None:
                     feats, trunk = extract_token_features(
                         model, inputs["pixel_values"], fusion_layer_indices
                     )
@@ -461,6 +546,8 @@ def train(args):
                     torch.save(mlp.state_dict(), f"{ckpt_dir}/mlp.pt")
                     if fusion is not None:
                         accelerator.unwrap_model(fusion).save(f"{ckpt_dir}/fusion.pt")
+                    if dual_fusion is not None:
+                        accelerator.unwrap_model(dual_fusion).save(f"{ckpt_dir}/dual_fusion.pt")
                     _clean_old_checkpoints(stage, cfg["max_checkpoints"])
 
                 # Per-step logging
@@ -484,21 +571,13 @@ def train(args):
             # ── Validation (drives best-checkpoint selection) ────────────
             improved = False
             if cfg["do_eval"] and epoch % cfg["eval_epoch_steps"] == 0:
-                val_results, val_loss = evaluate(
-                    model, mlp, processor, val_loader, device,
-                    dry_run=cfg["dry_run"],
-                    fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
-                )
+                val_results, val_loss = _eval(val_loader)
                 val_SRCC, val_PLCC = val_results["SRCC"], val_results["PLCC"]
                 if val_SRCC > best_val_SRCC:
                     best_val_SRCC, best_val_PLCC, best_epoch = val_SRCC, val_PLCC, epoch + 1
                     improved = True
                     # Test the just-selected model. Test never drives selection.
-                    test_results, _ = evaluate(
-                        model, mlp, processor, test_loader, device,
-                        dry_run=cfg["dry_run"],
-                        fusion=(accelerator.unwrap_model(fusion) if fusion is not None else None),
-                    )
+                    test_results, _ = _eval(test_loader)
                     best_test_SRCC, best_test_PLCC = test_results["SRCC"], test_results["PLCC"]
                 if accelerator.is_main_process:
                     tqdm.write(f"  Epoch {epoch+1} — val SRCC: {val_SRCC:.4f}  val PLCC: {val_PLCC:.4f}  "
@@ -518,6 +597,9 @@ def train(args):
                     if fusion is not None:
                         log.update(_fusion_diagnostics(
                             accelerator.unwrap_model(fusion), fusion_layer_indices))
+                    if dual_fusion is not None:
+                        log.update(_fusion_diagnostics(
+                            accelerator.unwrap_model(dual_fusion), None))
                     tracker.log(log, step=global_step)
 
             # ── Best checkpoint (selected on validation) ──────────────────
@@ -528,6 +610,8 @@ def train(args):
                 torch.save(mlp.state_dict(), f"{best_dir}/mlp.pt")
                 if fusion is not None:
                     accelerator.unwrap_model(fusion).save(f"{best_dir}/fusion.pt")
+                if dual_fusion is not None:
+                    accelerator.unwrap_model(dual_fusion).save(f"{best_dir}/dual_fusion.pt")
                 tqdm.write(f"  [Best] val SRCC={best_val_SRCC:.4f} "
                            f"(test SRCC={best_test_SRCC:.4f}) saved to {best_dir}")
 
@@ -550,6 +634,8 @@ def train(args):
                     "best_epoch":         best_epoch,
                     "fusion_state_dict":  (accelerator.unwrap_model(fusion).state_dict()
                                            if fusion is not None else None),
+                    "dual_fusion_state_dict": (accelerator.unwrap_model(dual_fusion).state_dict()
+                                               if dual_fusion is not None else None),
                 }, resume_path)
 
     # ── Save final checkpoint + report the val-selected best ─────────────
@@ -560,6 +646,8 @@ def train(args):
         torch.save(mlp.state_dict(), f"{final_dir}/mlp.pt")
         if fusion is not None:
             accelerator.unwrap_model(fusion).save(f"{final_dir}/fusion.pt")
+        if dual_fusion is not None:
+            accelerator.unwrap_model(dual_fusion).save(f"{final_dir}/dual_fusion.pt")
 
         if cfg["do_eval"]:
             results = {
@@ -607,10 +695,12 @@ def parse_args():
 
     # Multi-layer fusion
     p.add_argument("--fusion_type", type=str, default="none",
-                   choices=["none", "mls", "adaptive", "cross_attention"],
+                   choices=["none", "mls", "soft_mls", "adaptive", "cross_attention"],
                    help="Multi-layer feature fusion before the MLP head. "
                         "'none' = vanilla single-layer get_image_features; "
                         "'mls' = RAE-V2 multi-layer sum (hard replace); "
+                        "'soft_mls' = trunk + alpha*MLS residual (keeps the trunk; "
+                        "alpha init = --fusion_gate_init); "
                         "'adaptive' = learned weighted residual (step-0 identical); "
                         "'cross_attention' = trunk queries the tapped layers' tokens, "
                         "residual via zero-init out_proj (step-0 identical).")
@@ -645,6 +735,28 @@ def parse_args():
                         "off); a small positive value (e.g. 0.1) turns it on at init so the "
                         "fusion isn't born switched off. Applies to adaptive (gate value) "
                         "and cross_attention (out_proj init scale).")
+
+    # Dual encoder (SigLIP trunk queries a frozen aux encoder's tokens)
+    p.add_argument("--aux_model_id", type=str, default=None,
+                   help="Auxiliary vision encoder for dual-encoder cross-attention fusion: "
+                        "a HuggingFace id or a local directory (e.g. DINOv3 from disk). "
+                        "When set, the frozen aux encoder supplies key/value tokens and the "
+                        "SigLIP trunk queries them (step-0 identical via zero-init out_proj). "
+                        "Mutually exclusive with --fusion_type. Recommended: a DINOv3 ViT-L "
+                        "checkpoint dir, or 'facebook/dinov2-large'.")
+    p.add_argument("--aux_processor_id", type=str, default=None,
+                   help="Image processor id/path for the aux encoder (default: --aux_model_id).")
+    p.add_argument("--aux_trust_remote_code", action="store_true",
+                   help="Pass trust_remote_code=True when loading the aux encoder/processor "
+                        "(needed for DINOv3 loaded from disk).")
+    p.add_argument("--aux_num_heads", type=int, default=8,
+                   help="Heads for the dual-encoder cross-attention (must divide --mlp_input_dim).")
+    p.add_argument("--aux_dropout", type=float, default=0.0,
+                   help="Dropout inside the dual-encoder cross-attention block.")
+    p.add_argument("--aux_gate_init", type=float, default=0.1,
+                   help="Warm-start the dual-encoder residual (out_proj init scale). "
+                        "Default 0.1 turns the residual on at init so the cross-attention "
+                        "block isn't born switched off (0.0 = step-0 identical, residual off).")
 
     # PEFT
     p.add_argument("--peft_method", type=str, default=TRAIN_CONFIG["peft_method"],
