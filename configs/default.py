@@ -63,6 +63,7 @@ def _make_dataset_paths(base: str) -> dict:
         "CLIVE":      f"{base}/CLIVE/ChallengeDB_release",
         "SPAQ":       f"{base}/SPAQ",
         "KADID10K":   f"{base}/KADID-10K",
+        "TID2013":    f"{base}/TID2013",
         "FLIVE":      f"{base}/FLIVE",
         "AGIQA3K":    f"{base}/AGIQA-3k",
         "AGIQA1K":    f"{base}/AGIQA-1k",

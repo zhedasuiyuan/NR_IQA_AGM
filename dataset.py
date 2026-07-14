@@ -407,6 +407,49 @@ class KADID10K(Dataset):
         return {'image': image, 'score': score}
 
 
+class TID2013(Dataset):
+    """TID2013 synthetic-distortion IQA dataset (24 distortion types x 5 levels).
+
+    Assumes the standard official layout under ``path_to_db``::
+
+        distorted_images/   iXX_YY_Z.bmp   (XX=reference, YY=distortion type, Z=level)
+        mos_with_names.txt   lines: "<MOS> <filename>"  e.g. "5.51429 i01_01_1.bmp"
+
+    MOS is higher-is-better (range ~0-9); normalised to [0,1] via /9. Filenames
+    share the ``iXX`` reference prefix, so ``build_splits`` groups by reference
+    (via ``_reference_keys``) to avoid content leakage across splits.
+    """
+    def __init__(self, path_to_db):
+        self.root = path_to_db
+        self.db_name = 'TID2013'
+        self.image_size = image_size
+
+        if not os.path.exists(self.root):
+            raise ValueError(f"Path {self.root} does not exist")
+
+        self.image_dir = os.path.join(self.root, 'distorted_images')
+        mos_file = os.path.join(self.root, 'mos_with_names.txt')
+        if not os.path.exists(mos_file):
+            raise ValueError(f"Path {mos_file} does not exist")
+
+        # "<MOS> <filename>" per line; column named 'dist_img' so _reference_keys
+        # can derive the reference id from the filename prefix.
+        self.data = pd.read_csv(
+            mos_file, sep=r'\s+', header=None, names=['mos', 'dist_img']
+        )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image_name, score = self.data.iloc[idx]['dist_img'], self.data.iloc[idx]['mos'] / 9
+        image_path = os.path.join(self.image_dir, image_name)
+        image = Image.open(image_path).convert('RGB')
+        image = image.resize((self.image_size, self.image_size))
+        image = torch.from_numpy(np.array(image).transpose(2, 0, 1)).float()
+        score = torch.tensor(score).float()
+        return {'image': image, 'score': score}
+
 
 class FLIVE(Dataset):
     def __init__(self, path_to_db ):
@@ -500,6 +543,7 @@ _DATASET_CTORS = {
     "KonIQ_10K": lambda p: KonIQ_10K(path_to_db=p["KonIQ_10K"]),
     "SPAQ":      lambda p: SPAQ(path_to_db=p["SPAQ"]),
     "KADID10K":  lambda p: KADID10K(path_to_db=p["KADID10K"]),
+    "TID2013":   lambda p: TID2013(path_to_db=p["TID2013"]),
     "FLIVE":     lambda p: FLIVE(path_to_db=p["FLIVE"]),
     "AGIQA3K":   lambda p: AGIQA3K(path_to_db=p["AGIQA3K"]),
     "AGIQA1K":   lambda p: AGIQA1K(path_to_db=p["AGIQA1K"]),
@@ -517,7 +561,7 @@ _CROSS_DATASETS = {
 # Synthetic-distortion datasets where many distorted images share one reference
 # image: these must be split *by reference* so a scene never straddles the
 # train/val/test boundary (random splitting on distorted images leaks content).
-_REFERENCE_GROUPED = {"KADID10K"}
+_REFERENCE_GROUPED = {"KADID10K", "TID2013"}
 
 
 def _reference_keys(dataset) -> list:
