@@ -272,8 +272,8 @@ def _build_layer_cache(model, processor, dataset, layers, device, batch_size, pa
     an fp16 memmap at ``path``. Returns ``(memmap, scores[N])`` (order preserved)."""
     N, L = len(dataset), len(layers)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    mm, ys, start = None, [], 0
-    for batch in loader:
+    mm, ys, start, t0 = None, [], 0, time.time()
+    for bi, batch in enumerate(loader):
         pv = _to_pixel_values(processor, batch["image"], model, device)
         with torch.no_grad():
             feats, _ = extract_token_features(model, pv, layers)
@@ -284,7 +284,10 @@ def _build_layer_cache(model, processor, dataset, layers, device, batch_size, pa
         mm[start:start + arr.shape[0]] = arr
         start += arr.shape[0]
         ys.append(batch["score"].float())
-    mm.flush()
+        if (bi + 1) % 25 == 0:  # visible progress -- the build is I/O-heavy and silent
+            gb = start * L * arr.shape[2] * arr.shape[3] * 2 / 1e9
+            print(f"    ...{start}/{N} cached ({gb:.0f} GB, {time.time() - t0:.0f}s)", flush=True)
+    mm.flush()  # force writeback of remaining dirty pages (can stall on a big cache)
     return mm, torch.cat(ys).numpy()
 
 
