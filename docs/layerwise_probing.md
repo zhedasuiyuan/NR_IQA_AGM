@@ -134,6 +134,15 @@ Key flags: `--attention` (add the learned probe), `--attn_topk 0` = all layers
 (default), `--attn_epochs/--attn_lr/--attn_max_train`, `--breakdown`,
 `--max_images` (smoke test).
 
+**Speeding up the attention probe.** It re-runs the frozen backbone every epoch,
+which is compute-bound (batch size won't help — the GPU is already saturated).
+`--attn_cache_dir /data/probe_cache` forwards the backbone **once**, caching the
+tapped layers' tokens as an fp16 memmap, then trains the heads off the cache
+(~epochs× fewer forwards; test scored live). Cost: ~0.5 TB disk per dataset for
+all 27 layers (63.7 MB/image; the OS page cache makes single-run reads near-RAM
+speed). Deleted after the run unless `--keep_cache`. Cheaper alternatives if you
+skip caching: fewer `--attn_epochs`, smaller `--attn_max_train`.
+
 ### How to read the results
 
 - `mean` is the trustworthy scientific claim (where signal lives). `native` is

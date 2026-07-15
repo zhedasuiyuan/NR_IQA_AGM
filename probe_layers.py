@@ -262,6 +262,117 @@ def attention_probe(model, processor, train_ds, val_ds, test_ds, layers, dim, de
 
 
 # ---------------------------------------------------------------------------
+# Cached attention probe: forward the frozen backbone ONCE, store the tapped
+# layers' tokens as fp16 memmaps, then train the heads off the cache. Trades
+# disk for ~epochs-fewer backbone passes -- the win when the backbone forward is
+# the (compute-bound) bottleneck and re-running it every epoch is pure waste.
+# ---------------------------------------------------------------------------
+def _build_layer_cache(model, processor, dataset, layers, device, batch_size, path):
+    """Forward the backbone once over ``dataset``; write the ``layers`` tokens to
+    an fp16 memmap at ``path``. Returns ``(memmap, scores[N])`` (order preserved)."""
+    N, L = len(dataset), len(layers)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    mm, ys, start = None, [], 0
+    for batch in loader:
+        pv = _to_pixel_values(processor, batch["image"], model, device)
+        with torch.no_grad():
+            feats, _ = extract_token_features(model, pv, layers)
+        arr = torch.stack(feats, dim=1).to(torch.float16).cpu().numpy()  # [b, L, Ntok, D]
+        if mm is None:
+            mm = np.memmap(path, dtype=np.float16, mode="w+",
+                           shape=(N, L, arr.shape[2], arr.shape[3]))
+        mm[start:start + arr.shape[0]] = arr
+        start += arr.shape[0]
+        ys.append(batch["score"].float())
+    mm.flush()
+    return mm, torch.cat(ys).numpy()
+
+
+@torch.no_grad()
+def _attn_eval_mm(probes, mm, y, layers, device, batch_size):
+    """Evaluate trained probes over a cached memmap. Returns ``{layer: (srcc, plcc, preds)}``."""
+    for p in probes.values():
+        p.eval()
+    preds = {l: [] for l in layers}
+    for i in range(0, mm.shape[0], batch_size):
+        toks = torch.from_numpy(np.ascontiguousarray(mm[i:i + batch_size])).to(device)
+        for li, l in enumerate(layers):
+            preds[l].append(probes[str(l)](toks[:, li].float()).cpu())
+    return {l: (spearmanr(pr := torch.cat(preds[l]).numpy(), y)[0], pearsonr(pr, y)[0], pr)
+            for l in layers}
+
+
+def attention_probe_cached(model, processor, train_ds, val_ds, test_ds, layers, dim, device,
+                           batch_size, epochs, lr, num_heads, max_train, seed,
+                           cache_dir, run_id, keep_cache):
+    """Cached counterpart of :func:`attention_probe`. Same result, but the
+    backbone forwards once (per split) instead of every epoch."""
+    tr = train_ds
+    if max_train and len(train_ds) > max_train:
+        idx = np.random.default_rng(seed).permutation(len(train_ds))[:max_train]
+        tr = Subset(train_ds, idx.tolist())
+
+    # Per-run subdir so a hard-killed job's leftovers are one `rm -rf` away.
+    run_cache = os.path.join(cache_dir, run_id)
+    os.makedirs(run_cache, exist_ok=True)
+    tr_path = os.path.join(run_cache, "train.f16")
+    va_path = os.path.join(run_cache, "val.f16")
+    print(f"  [attn] caching {len(tr)} train + {len(val_ds)} val x {len(layers)} layers -> {cache_dir}")
+    tr_mm, ytr = _build_layer_cache(model, processor, tr, layers, device, batch_size, tr_path)
+    va_mm, yva = _build_layer_cache(model, processor, val_ds, layers, device, batch_size, va_path)
+    print(f"  [attn] cache built ({(tr_mm.nbytes + va_mm.nbytes) / 1e9:.0f} GB); "
+          f"training heads for {epochs} epochs")
+
+    probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
+    opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
+    best_val = {l: -2.0 for l in layers}
+    best_state = {l: None for l in layers}
+    rng = np.random.default_rng(seed)
+    N = tr_mm.shape[0]
+
+    try:
+        for ep in range(epochs):
+            for p in probes.values():
+                p.train()
+            order = rng.permutation(N)
+            for i in range(0, N, batch_size):
+                bidx = np.sort(order[i:i + batch_size])  # sorted -> more sequential reads
+                toks = torch.from_numpy(np.ascontiguousarray(tr_mm[bidx])).to(device)
+                y = torch.from_numpy(ytr[bidx]).to(device).float()
+                opt.zero_grad()
+                loss = sum(F.mse_loss(probes[str(l)](toks[:, li].float()), y)
+                           for li, l in enumerate(layers))
+                loss.backward()
+                opt.step()
+
+            val = _attn_eval_mm(probes, va_mm, yva, layers, device, batch_size)
+            for l in layers:
+                if val[l][0] > best_val[l]:
+                    best_val[l] = val[l][0]
+                    best_state[l] = copy.deepcopy(probes[str(l)].state_dict())
+            print(f"  [attn] epoch {ep + 1}/{epochs} val SRCC "
+                  + " ".join(f"L{l}={val[l][0]:.3f}" for l in layers))
+    finally:
+        del tr_mm, va_mm  # release memmaps before deleting the files
+        if not keep_cache:
+            for pth in (tr_path, va_path):
+                try:
+                    os.remove(pth)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(run_cache)
+            except OSError:
+                pass
+
+    for l in layers:
+        if best_state[l] is not None:
+            probes[str(l)].load_state_dict(best_state[l])
+    # test scored live (one forward, not cached)
+    return _attn_eval(probes, model, processor, test_ds, layers, device, batch_size)
+
+
+# ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", type=str, default="KADID10K",
@@ -293,6 +404,12 @@ def main():
     p.add_argument("--attn_max_train", type=int, default=0,
                    help="cap training images for the attention probe as a seeded "
                         "random subset (runtime guard); 0 = all (default)")
+    p.add_argument("--attn_cache_dir", type=str, default="",
+                   help="cache tapped-layer tokens here (fp16 memmap) so the frozen "
+                        "backbone forwards ONCE instead of every epoch -- recommended "
+                        "for all-layers on big data, e.g. /data/probe_cache")
+    p.add_argument("--keep_cache", action="store_true",
+                   help="keep the memmap cache after the run (default: delete it)")
     args = p.parse_args()
 
     # Per-run subfolder so repeated experiments don't overwrite each other.
@@ -360,14 +477,17 @@ def main():
             attn_layers = sorted(set(top) | {H})  # top-k plus the final layer
         else:
             attn_layers = list(layer_indices)  # all layers (default)
+        cached = " (cached)" if args.attn_cache_dir else ""
         print(f"Learned attention probe on layers {attn_layers} "
-              f"({args.attn_epochs} epochs, lr {args.attn_lr}) ...")
-        res = attention_probe(
-            model, processor, train_ds, val_ds, test_ds, attn_layers,
-            backbone_hidden_size(model), args.device, args.batch_size,
-            args.attn_epochs, args.attn_lr, args.attn_heads,
-            args.attn_max_train or None, args.seed,
-        )
+              f"({args.attn_epochs} epochs, lr {args.attn_lr}){cached} ...")
+        common = (model, processor, train_ds, val_ds, test_ds, attn_layers,
+                  backbone_hidden_size(model), args.device, args.batch_size,
+                  args.attn_epochs, args.attn_lr, args.attn_heads,
+                  args.attn_max_train or None, args.seed)
+        if args.attn_cache_dir:
+            res = attention_probe_cached(*common, args.attn_cache_dir, run_id, args.keep_cache)
+        else:
+            res = attention_probe(*common)
         for layer in attn_layers:
             srcc, plcc, pred = res[layer]
             rows.append({"pooling": "attention", "layer": layer, "srcc": srcc, "plcc": plcc})

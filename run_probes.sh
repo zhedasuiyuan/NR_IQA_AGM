@@ -16,21 +16,24 @@
 # Override any of these via env vars.
 #
 # ---- Recommended runs, in priority order -----------------------------------
+# All use token caching (--attn_cache_dir) so the backbone forwards once per run.
+#
 # P1  Pretraining-objective comparison (the mechanism argument vs PE): probe
 #     the SAME two datasets across contrastive (SigLIP2, CLIP) and non-contrastive
 #     (DINOv2) encoders. 3 models x 2 datasets = 6 jobs across 3 GPUs.
 #     VERIFY one CLIP/DINOv2 run first (see docs/layerwise_probing.md).
 #
 #   MODELS="google/siglip2-so400m-patch16-512 openai/clip-vit-large-patch14-336 facebook/dinov2-large" \
-#     DATASETS="KADID10K KonIQ_10K" ./run_probes.sh
+#     DATASETS="KADID10K KonIQ_10K" \
+#     EXTRA="--attention --attn_cache_dir /data/probe_cache" ./run_probes.sh
 #
-# P2  Main layer-wise curves: all 5 datasets on SigLIP2 (the script default).
+# P2  Main layer-wise curves: all 5 datasets on SigLIP2.
 #
-#   ./run_probes.sh
+#   EXTRA="--attention --attn_cache_dir /data/probe_cache" ./run_probes.sh
 #
 # P3  Robustness: repeat P2 over multiple seeds.
 #
-#   SEEDS="42 123 7" ./run_probes.sh
+#   SEEDS="42 123 7" EXTRA="--attention --attn_cache_dir /data/probe_cache" ./run_probes.sh
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -47,6 +50,11 @@ MODELS="${MODELS:-google/siglip2-so400m-patch16-512}"
 # Extra args passed to every run. --attention gives the PE-style probe on all
 # layers; drop it (or add --attn_max_train 3000) if a full run is too slow.
 # batch_size defaults to 32 (frozen backbone runs under no_grad); lower if OOM.
+# For all-layers attention on big data, cache tokens so the backbone forwards
+# once instead of every epoch (needs disk; ~0.5 TB per dataset):
+#   EXTRA="--attention --attn_cache_dir /data/probe_cache"
+# NOTE: 3 parallel cached runs = ~1.5 TB and exceed 504 GB page cache -> disk
+# reads each epoch. On slower disks, cut parallelism (GPUS="0") for cached runs.
 EXTRA="${EXTRA:---attention}"
 
 read -ra DS_ARR  <<< "$DATASETS"
