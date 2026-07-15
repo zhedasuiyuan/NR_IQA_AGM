@@ -22,7 +22,7 @@ Fast first cut: no training loop -- Ridge is closed-form, alpha is picked on the
 val split, and per-distortion curves reuse the same fitted model.
 
 Example:
-    python probe_layers.py --dataset KADID10K --batch_size 8
+    python probe_layers.py --dataset KADID10K --attention
     python probe_layers.py --dataset KonIQ_10K --max_images 2000   # quick smoke
 """
 
@@ -41,7 +41,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import pearsonr, spearmanr
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoImageProcessor, AutoModel, AutoProcessor
 
 from configs.default import MODEL_CONFIG, _make_dataset_paths
 from dataset import build_splits
@@ -77,21 +77,31 @@ DISTORTION_GROUPS = {
 }
 
 
-def _groupings(groups_map, test_types, which):
-    """Ordered breakdown items per requested granularity.
+def _breakdown_facets(groups_map, test_types, test_levels, which):
+    """Ordered breakdown facets for the synthetic-set analysis.
 
-    Returns ``{granularity: [(label, group, type_ids), ...]}``. ``group`` breaks
-    down by distortion family; ``type`` breaks down by each distortion id present
-    in the test split (tagged with its family). ``both`` returns both.
+    Each facet is ``(name, per_item_values, items)`` where
+    ``items = [(label, group, subset_values), ...]`` and a row's mask is
+    ``np.isin(per_item_values, subset_values)``:
+
+    * ``group`` -- distortion family (readable headline).
+    * ``type``  -- each distortion id present, tagged with its family (fine detail).
+    * ``level`` -- distortion **severity** (1..5); the depth-vs-severity axis.
+
+    ``which`` (group/type/both) controls the type axis; ``level`` is always
+    included when severities are available.
     """
     type2group = {t: g for g, ts in groups_map.items() for t in ts}
-    out = {}
+    facets = []
     if which in ("group", "both"):
-        out["group"] = [(g, g, ts) for g, ts in groups_map.items()]
+        facets.append(("group", test_types, [(g, g, ts) for g, ts in groups_map.items()]))
     if which in ("type", "both"):
         present = sorted(set(int(t) for t in test_types))
-        out["type"] = [(t, type2group.get(t, "?"), [t]) for t in present]
-    return out
+        facets.append(("type", test_types, [(t, type2group.get(t, "?"), [t]) for t in present]))
+    if test_levels is not None:
+        levels = sorted(set(int(lv) for lv in test_levels))
+        facets.append(("level", test_levels, [(lv, "", [lv]) for lv in levels]))
+    return facets
 
 
 def _to_pixel_values(processor, images, model, device):
@@ -258,10 +268,13 @@ def main():
                    help="within-dataset id: KADID10K, KonIQ_10K, SPAQ, CLIVE, ...")
     p.add_argument("--data_dir", type=str, default="./Dataset")
     p.add_argument("--model_id", type=str, default=MODEL_CONFIG["model_id"])
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out_dir", type=str, default="probe_out")
+    p.add_argument("--tag", type=str, default="",
+                   help="appended to the run-folder name; keeps parallel runs of "
+                        "the same dataset from colliding on an identical timestamp")
     p.add_argument("--max_images", type=int, default=None,
                    help="cap images per split for a quick smoke test")
     p.add_argument("--breakdown", choices=["group", "type", "both"], default="both",
@@ -283,7 +296,8 @@ def main():
     args = p.parse_args()
 
     # Per-run subfolder so repeated experiments don't overwrite each other.
-    run_id = f"{args.dataset}_{time.strftime('%Y%m%d_%H%M%S')}"
+    tag = f"_{args.tag}" if args.tag else ""
+    run_id = f"{args.dataset}{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
     args.out_dir = os.path.join(args.out_dir, run_id)
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Run outputs -> {args.out_dir}")
@@ -292,7 +306,10 @@ def main():
     paths = _make_dataset_paths(args.data_dir)
 
     print(f"Loading {args.model_id} ...")
-    processor = AutoProcessor.from_pretrained(args.model_id)
+    try:  # SigLIP/CLIP have a full processor; DINOv2 is vision-only -> image processor
+        processor = AutoProcessor.from_pretrained(args.model_id)
+    except Exception:
+        processor = AutoImageProcessor.from_pretrained(args.model_id)
     model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.bfloat16).to(args.device).eval()
 
     H = backbone_num_hidden_layers(model)
@@ -301,20 +318,22 @@ def main():
 
     train_ds, val_ds, test_ds = build_splits(args.dataset, paths, args.seed)
 
-    # Synthetic sets (KADID/TID): per-item distortion type of the *test* split
-    # (order matches extraction). Parsed from the ``..._TT_..`` filename field.
+    # Synthetic sets (KADID/TID): per-item distortion type + severity level of the
+    # *test* split (order matches extraction). Parsed from the ``..._TT_LL`` fields.
     groups_map = DISTORTION_GROUPS.get(args.dataset)
-    test_types = None
+    test_types = test_levels = None
     if groups_map is not None:
         full, idx_te = test_ds.dataset, test_ds.indices
-        test_types = np.array([int(full.data.iloc[i]["dist_img"].split("_")[1]) for i in idx_te])
+        names = [full.data.iloc[i]["dist_img"] for i in idx_te]
+        test_types = np.array([int(n.split("_")[1]) for n in names])
+        test_levels = np.array([int(n.split("_")[2].split(".")[0]) for n in names])
 
     if args.max_images is not None:
-        from torch.utils.data import Subset
         cap = lambda ds: Subset(ds, list(range(min(args.max_images, len(ds)))))
         train_ds, val_ds, test_ds = cap(train_ds), cap(val_ds), cap(test_ds)
         if test_types is not None:
             test_types = test_types[: len(test_ds)]
+            test_levels = test_levels[: len(test_ds)]
 
     print("Extracting features (train/val/test) ...")
     tr_mean, tr_nat, ytr = extract_pooled(model, processor, train_ds, layer_indices, args.device, args.batch_size)
@@ -363,17 +382,18 @@ def main():
     print(f"Wrote {overall_csv}")
 
     # ---- synthetic sets (KADID/TID): per-distortion SRCC at each layer ----
-    # ``by_group`` is the readable headline figure; ``by_type`` is the fine detail.
+    # by_group = readable headline; by_type = fine detail; by_level = severity axis.
     # (For the group CSV, the ``label`` column equals ``group`` by construction.)
-    groupings = _groupings(groups_map, test_types, args.breakdown) if test_types is not None else {}
-    for gran, items in groupings.items():
-        path = os.path.join(args.out_dir, f"{args.dataset}_by_{gran}.csv")
+    facets = (_breakdown_facets(groups_map, test_types, test_levels, args.breakdown)
+              if test_types is not None else [])
+    for fname, values, items in facets:
+        path = os.path.join(args.out_dir, f"{args.dataset}_by_{fname}.csv")
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["pooling", "layer", "label", "group", "srcc", "n"])
             writer.writeheader()
             for (name, layer), pred in te_preds.items():
-                for label, group, type_ids in items:
-                    mask = np.isin(test_types, type_ids)
+                for label, group, subset in items:
+                    mask = np.isin(values, subset)
                     if mask.sum() < 10:
                         continue
                     writer.writerow({"pooling": name, "layer": layer, "label": label,
@@ -381,10 +401,10 @@ def main():
                                      "n": int(mask.sum())})
         print(f"Wrote {path}")
 
-    _try_plot(args, rows, te_preds, test_types, yte, layer_indices, groupings)
+    _try_plot(args, rows, te_preds, yte, layer_indices, facets)
 
 
-def _try_plot(args, rows, te_preds, test_types, yte, layer_indices, groupings):
+def _try_plot(args, rows, te_preds, yte, layer_indices, facets):
     """Best-effort matplotlib figures; never blocks CSV output."""
     try:
         import matplotlib
@@ -414,12 +434,12 @@ def _try_plot(args, rows, te_preds, test_types, yte, layer_indices, groupings):
     out = os.path.join(args.out_dir, f"{args.dataset}_layerwise.png")
     plt.savefig(out, dpi=150); print(f"Wrote {out}")
 
-    # Synthetic-set heatmaps: distortion (group and/or type) x layer, mean-pool.
-    for gran, items in groupings.items():
+    # Synthetic-set heatmaps: distortion (group/type/level) x layer, mean-pool.
+    for fname, values, items in facets:
         labels = [str(lbl) for lbl, _, _ in items]
         mat = np.full((len(items), len(layer_indices)), np.nan)
-        for ri, (_, _, type_ids) in enumerate(items):
-            mask = np.isin(test_types, type_ids)
+        for ri, (_, _, subset) in enumerate(items):
+            mask = np.isin(values, subset)
             if mask.sum() < 10:
                 continue
             for cj, layer in enumerate(layer_indices):
@@ -430,9 +450,9 @@ def _try_plot(args, rows, te_preds, test_types, yte, layer_indices, groupings):
         plt.yticks(range(len(labels)), labels)
         plt.xticks(range(len(layer_indices)), layer_indices)
         plt.xlabel("layer")
-        plt.title(f"{args.dataset}: SRCC by distortion {gran} (mean-pool)")
+        plt.title(f"{args.dataset}: SRCC by distortion {fname} (mean-pool)")
         plt.tight_layout()
-        out = os.path.join(args.out_dir, f"{args.dataset}_heatmap_{gran}.png")
+        out = os.path.join(args.out_dir, f"{args.dataset}_heatmap_{fname}.png")
         plt.savefig(out, dpi=150); print(f"Wrote {out}")
 
 

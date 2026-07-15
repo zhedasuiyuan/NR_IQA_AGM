@@ -92,9 +92,22 @@ registered in `_DATASET_CTORS` / `_REFERENCE_GROUPED` and `configs/default.py`.
 - `{dataset}_by_group.csv` / `{dataset}_by_type.csv` — per-distortion SRCC ×
   layer × probe (`--breakdown {group,type,both}`, default both). Shared schema
   `pooling, layer, label, group, srcc, n`; type rows carry their family tag.
+- `{dataset}_by_level.csv` — SRCC × layer × probe broken down by **severity
+  level** (1–5), always emitted for synthetic sets. Tests whether optimal depth
+  depends on distortion *strength* (an IQA-specific axis PE never studied).
 - `{dataset}_layerwise.png` — the three curves overlaid (the key figure).
-- `{dataset}_heatmap_{group,type}.png` — SRCC over (distortion × layer),
+- `{dataset}_heatmap_{group,type,level}.png` — SRCC over (distortion × layer),
   mean-pool. **Distortion-dependent peaks here are the novelty hinge vs PE.**
+
+### Backbones
+
+Default `--model_id` is `google/siglip2-so400m-patch16-512`. The probe is
+backbone-agnostic (hidden size auto-detected), so **CLIP** and **DINOv2** work
+for the pretraining-objective comparison — the key control being non-contrastive
+DINOv2. Notes: for non-SigLIP backbones the `native` probe falls back to mean
+pooling (they lack SigLIP's MAP head), so read `mean` and `attention` for those;
+processor loading falls back to `AutoImageProcessor` for vision-only DINOv2.
+*Code-verified only — run one CLIP/DINOv2 job before trusting a sweep.*
 
 ### Usage
 
@@ -102,9 +115,15 @@ registered in `_DATASET_CTORS` / `_REFERENCE_GROUPED` and `configs/default.py`.
 # fast smoke test end-to-end (caps images, few epochs)
 python probe_layers.py --dataset KonIQ_10K --max_images 300 --attention --attn_epochs 3
 
-# full run: linear (mean+native) + learned attention probe on ALL layers, both breakdowns
-python probe_layers.py --dataset KADID10K --attention --batch_size 8
-python probe_layers.py --dataset TID2013  --attention --batch_size 8
+# full run: linear (mean+native) + learned attention probe on ALL layers, all breakdowns
+python probe_layers.py --dataset KADID10K --attention
+python probe_layers.py --dataset TID2013  --attention
+
+# multi-GPU sweep (round-robins dataset/seed/backbone across GPUs)
+./run_probes.sh
+SEEDS="42 123 7" ./run_probes.sh                                   # robustness
+MODELS="google/siglip2-so400m-patch16-512 facebook/dinov2-large" \
+  DATASETS="KADID10K KonIQ_10K" ./run_probes.sh                    # backbone comparison
 
 # restrict the attention probe (memory/time), or pin layers
 python probe_layers.py --dataset KADID10K --attention --attn_topk 3
@@ -189,7 +208,8 @@ foundation-model features are wrong for IQA, plus the corrective.
 
 | File | Change |
 |---|---|
-| `probe_layers.py` | **New.** Frozen-backbone layer-wise probe: `extract_pooled`, `ridge_probe`, `AttnPool` + `attention_probe` (learned attention probe), `DISTORTION_GROUPS` + `_groupings` (group/type breakdown), CSV + matplotlib outputs. |
+| `probe_layers.py` | **New.** Frozen-backbone layer-wise probe: `extract_pooled`, `ridge_probe`, `AttnPool` + `attention_probe` (learned attention probe), `DISTORTION_GROUPS` + `_breakdown_facets` (group/type/level breakdown), CSV + matplotlib outputs. CLIP/DINOv2-compatible (processor fallback). |
+| `run_probes.sh` | **New.** Multi-GPU sweep: round-robins (model, dataset, seed) jobs across `GPUS`, per-job logs, `--tag` to keep run folders distinct. |
 | `dataset.py` | **New** `TID2013` class; registered in `_DATASET_CTORS` and `_REFERENCE_GROUPED`. |
 | `configs/default.py` | `TID2013` path in `_make_dataset_paths`. |
 
