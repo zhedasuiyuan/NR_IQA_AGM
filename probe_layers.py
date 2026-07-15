@@ -204,7 +204,7 @@ def _attn_eval(probes, model, processor, dataset, layers, device, batch_size):
 
 
 def attention_probe(model, processor, train_ds, val_ds, test_ds, layers, dim, device,
-                    batch_size, epochs, lr, num_heads, max_train):
+                    batch_size, epochs, lr, num_heads, max_train, seed):
     """Train one :class:`AttnPool` per target layer (heads share each backbone
     forward), early-stop each head on its own val SRCC, and score on test.
 
@@ -212,7 +212,10 @@ def attention_probe(model, processor, train_ds, val_ds, test_ds, layers, dim, de
     """
     tr = train_ds
     if max_train and len(train_ds) > max_train:
-        tr = Subset(train_ds, list(range(max_train)))  # deterministic head subset
+        # seeded random subset (representative; not the first-N, which would
+        # bias which references/scenes the head sees on grouped-split datasets).
+        idx = np.random.default_rng(seed).permutation(len(train_ds))[:max_train]
+        tr = Subset(train_ds, idx.tolist())
 
     probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
     opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
@@ -272,8 +275,9 @@ def main():
     p.add_argument("--attn_epochs", type=int, default=20)
     p.add_argument("--attn_lr", type=float, default=1e-3)
     p.add_argument("--attn_heads", type=int, default=8)
-    p.add_argument("--attn_max_train", type=int, default=4000,
-                   help="cap training images for the attention probe (runtime); 0 = all")
+    p.add_argument("--attn_max_train", type=int, default=0,
+                   help="cap training images for the attention probe as a seeded "
+                        "random subset (runtime guard); 0 = all (default)")
     args = p.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -335,7 +339,7 @@ def main():
             model, processor, train_ds, val_ds, test_ds, attn_layers,
             backbone_hidden_size(model), args.device, args.batch_size,
             args.attn_epochs, args.attn_lr, args.attn_heads,
-            args.attn_max_train or None,
+            args.attn_max_train or None, args.seed,
         )
         for layer in attn_layers:
             srcc, plcc, pred = res[layer]
