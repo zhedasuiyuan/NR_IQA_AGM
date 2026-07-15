@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import json
 import os
 import time
 
@@ -286,6 +287,8 @@ def main():
     args.out_dir = os.path.join(args.out_dir, run_id)
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Run outputs -> {args.out_dir}")
+    with open(os.path.join(args.out_dir, "config.json"), "w") as f:
+        json.dump({"run_id": run_id, **vars(args)}, f, indent=2)
     paths = _make_dataset_paths(args.data_dir)
 
     print(f"Loading {args.model_id} ...")
