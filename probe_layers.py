@@ -32,6 +32,7 @@ import argparse
 import copy
 import csv
 import os
+import time
 
 import numpy as np
 import torch
@@ -280,7 +281,11 @@ def main():
                         "random subset (runtime guard); 0 = all (default)")
     args = p.parse_args()
 
+    # Per-run subfolder so repeated experiments don't overwrite each other.
+    run_id = f"{args.dataset}_{time.strftime('%Y%m%d_%H%M%S')}"
+    args.out_dir = os.path.join(args.out_dir, run_id)
     os.makedirs(args.out_dir, exist_ok=True)
+    print(f"Run outputs -> {args.out_dir}")
     paths = _make_dataset_paths(args.data_dir)
 
     print(f"Loading {args.model_id} ...")
