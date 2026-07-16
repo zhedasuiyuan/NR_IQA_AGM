@@ -75,6 +75,8 @@ for ds in "${DS_ARR[@]}"; do
   JOBS+=("$ds|E_adaptimage|$nsel|--fusion_type adaptive --adaptive_conditioning image --fusion_layers $sel")
   JOBS+=("$ds|F_mls|$nsel|--fusion_type mls --fusion_layers $sel")
   JOBS+=("$ds|G_topkattn|$ntop|--fusion_type cross_attention --fusion_layers $topk")
+  JOBS+=("$ds|H_alf_all|all|--fusion_type alf --fusion_stride 1")
+  JOBS+=("$ds|I_alf_sel|$nsel|--fusion_type alf --fusion_layers $sel")
 done
 [ ${#JOBS[@]} -eq 0 ] && { echo "No jobs to run."; exit 1; }
 
@@ -124,5 +126,6 @@ echo
 echo "=== pilot results ($out) ==="
 column -s, -t "$out" 2>/dev/null || cat "$out"
 echo
-echo "Reads: B_allattn is the ALF analog. C beats B with fewer layers => efficiency;"
-echo "E beats B => a real method delta; C beats G => complementarity > marginal selection."
+echo "Reads: B_allattn = our cross-attn (all layers); H_alf_all = ALF (all layers) --"
+echo "  their head-to-head is the key aggregator comparison. C vs B: selection = efficiency;"
+echo "  C vs G: complementarity > marginal selection; I_alf_sel: ALF on the selected set."

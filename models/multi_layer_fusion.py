@@ -361,6 +361,52 @@ class TokenCrossAttentionFusion(nn.Module):
         return trunk + self.drop(fused).to(trunk.dtype)
 
 
+class TokenALFusion(nn.Module):
+    """Attentive Layer Fusion (ALF, arXiv:2601.09322) -- a *different* aggregator
+    from :class:`TokenCrossAttentionFusion`, added for a faithful comparison.
+
+    A single learned query cross-attends over per-layer **summary** tokens and
+    outputs the pooled feature **directly** (it replaces the backbone pooler, so
+    ``MultiLayerFusion.returns_pooled`` is True and ``native_pool`` is skipped).
+
+    How it differs from this repo's cross-attention fusion:
+      * query = one learned prototype vector, not the trunk's ``N`` tokens;
+      * key/value = one summary token *per layer* (``L`` tokens), not the full
+        ``L*N`` spatial tokens;
+      * output = a single ``[B, D]`` vector to the head, not a token-level
+        residual added back to the trunk (so it is NOT step-0 identical).
+
+    Per-layer summary tokens: ``use_cls=True`` uses ALF's faithful **CLS + AP**
+    (token 0 + mean), i.e. 2 tokens/layer -- for CLS-bearing backbones (CLIP,
+    DINO). ``use_cls=False`` uses **AP only** (1 token/layer) for SigLIP2, which
+    has no CLS token. No pre-attention norm, no residual, per the paper --
+    ``nn.MultiheadAttention``'s own ``out_proj`` is ALF's Wout.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0,
+                 use_cls: bool = False):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_size {dim} is not divisible by fusion_num_heads {num_heads}."
+            )
+        self.use_cls = use_cls
+        self.query = nn.Parameter(torch.randn(1, 1, dim) * dim ** -0.5)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout
+        )
+
+    def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
+        parts = []
+        for f in layer_features:
+            ap = f.mean(dim=1, keepdim=True)                 # [B, 1, D] average-pool
+            parts.append(torch.cat([f[:, :1], ap], dim=1) if self.use_cls else ap)
+        summ = torch.cat(parts, dim=1)                       # [B, (2 or 1)*L, D]
+        q = self.query.expand(summ.shape[0], -1, -1).to(summ.dtype)  # [B, 1, D]
+        pooled, _ = self.attn(q, summ, summ)                 # [B, 1, D]
+        return pooled[:, 0]                                  # [B, D] -> straight to head
+
+
 # ---------------------------------------------------------------------------
 # Container: holds the fusion module + the resolved layer indices, with
 # self-describing save/load so eval can rebuild without CLI flags.
@@ -385,6 +431,7 @@ class MultiLayerFusion(nn.Module):
         fusion_num_heads: int = 8,
         fusion_gate_init: float = 0.0,
         dropout: float = 0.0,
+        alf_use_cls: bool = False,
     ):
         super().__init__()
         self.fusion_type = fusion_type
@@ -406,11 +453,20 @@ class MultiLayerFusion(nn.Module):
                 num_layers=L, dim=hidden_size,
                 num_heads=fusion_num_heads, dropout=dropout, gate_init=fusion_gate_init,
             )
+        elif fusion_type == "alf":
+            self.fuser = TokenALFusion(
+                dim=hidden_size, num_heads=fusion_num_heads, dropout=dropout,
+                use_cls=alf_use_cls,
+            )
         else:
             raise ValueError(
                 f"fusion_type='{fusion_type}' invalid; expected "
-                "'mls', 'soft_mls', 'adaptive', or 'cross_attention'"
+                "'mls', 'soft_mls', 'adaptive', 'cross_attention', or 'alf'"
             )
+
+        # ALF outputs the pooled [B, D] vector directly (replaces native_pool);
+        # every other fuser returns [B, N, D] tokens that native_pool then pools.
+        self.returns_pooled = fusion_type == "alf"
 
         # Self-describing config for checkpoint round-trips.
         self.config = dict(
@@ -422,6 +478,7 @@ class MultiLayerFusion(nn.Module):
             fusion_num_heads=fusion_num_heads,
             fusion_gate_init=fusion_gate_init,
             dropout=dropout,
+            alf_use_cls=alf_use_cls,
         )
 
     @classmethod

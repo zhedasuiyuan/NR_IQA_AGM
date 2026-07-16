@@ -299,6 +299,7 @@ def train(args):
             fusion_num_heads=args.fusion_num_heads,
             fusion_gate_init=args.fusion_gate_init,
             dropout=args.fusion_dropout,
+            alf_use_cls=args.alf_use_cls,
         ).to(device).to(torch.bfloat16)
         fusion.requires_grad_(True)
         print(f"Multi-layer fusion: type={args.fusion_type} "
@@ -424,6 +425,8 @@ def train(args):
     # The tapped indices are needed in the training loop; capture them before
     # `prepare` wraps `fusion` (the wrapper hides plain attributes).
     fusion_layer_indices = fusion.layer_indices if fusion is not None else None
+    # ALF returns the pooled [B, D] vector directly (skip native_pool).
+    fusion_returns_pooled = getattr(fusion, "returns_pooled", False) if fusion is not None else False
 
     # ── Accelerator prepare ──────────────────────────────────────────────
     # fusion and dual_fusion are mutually exclusive (enforced at build time).
@@ -503,7 +506,7 @@ def train(args):
                         model, inputs["pixel_values"], fusion_layer_indices
                     )
                     fused = fusion(feats, trunk)
-                    features = native_pool(model, fused)
+                    features = fused if fusion_returns_pooled else native_pool(model, fused)
                 else:
                     try:
                         features = model.module.get_image_features(**inputs)
@@ -695,7 +698,7 @@ def parse_args():
 
     # Multi-layer fusion
     p.add_argument("--fusion_type", type=str, default="none",
-                   choices=["none", "mls", "soft_mls", "adaptive", "cross_attention"],
+                   choices=["none", "mls", "soft_mls", "adaptive", "cross_attention", "alf"],
                    help="Multi-layer feature fusion before the MLP head. "
                         "'none' = vanilla single-layer get_image_features; "
                         "'mls' = RAE-V2 multi-layer sum (hard replace); "
@@ -730,6 +733,10 @@ def parse_args():
     p.add_argument("--fusion_dropout", type=float, default=0.0,
                    help="Dropout inside the fusion module (cross_attention / "
                         "adaptive image conditioning).")
+    p.add_argument("--alf_use_cls", action="store_true",
+                   help="ALF only: use CLS+AP summary tokens per layer (faithful for "
+                        "CLS-bearing backbones like CLIP/DINO). Default AP-only (SigLIP2 "
+                        "has no CLS).")
     p.add_argument("--fusion_gate_init", type=float, default=0.0,
                    help="Warm-start the fusion residual. 0.0 = step-0 identical (residual "
                         "off); a small positive value (e.g. 0.1) turns it on at init so the "

@@ -37,7 +37,9 @@ class SIGLIPWithMLP(nn.Module):
         if self.fusion is not None:
             feats, trunk = extract_token_features(self.siglip, inputs, self.fusion.layer_indices)
             fused = self.fusion(feats, trunk)
-            features = native_pool(self.siglip, fused)
+            # ALF returns the pooled [B, D] vector directly; others return tokens.
+            features = (fused if getattr(self.fusion, "returns_pooled", False)
+                        else native_pool(self.siglip, fused))
             scores = self.mlp_head(features)
             return scores.squeeze(1)
 
