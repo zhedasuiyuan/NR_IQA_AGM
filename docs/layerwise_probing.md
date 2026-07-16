@@ -170,8 +170,9 @@ and 2 coupled instead of two disjoint mini-papers.
 
 ### Candidate method hooks (novelty beyond vanilla attention)
 
-Vanilla cross-attention aggregation is *not* a contribution on its own (it is
-ported from VisualQuality-R1; see `docs/multi_layer_fusion.md`). Real hooks:
+Vanilla cross-attention aggregation is *not* a contribution on its own -- it is a
+common approach in the vision/IQA literature (and MLS is from RAEv2); cite those,
+not this repo. So the novelty must come from the analysis/selection. Real hooks:
 
 1. **Distortion-conditioned weights** — `TokenAdaptiveFusion` image-conditioned
    weights, framed as the *consequence* of distortion-dependent depth. Ablate
