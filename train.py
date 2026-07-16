@@ -300,6 +300,7 @@ def train(args):
             fusion_gate_init=args.fusion_gate_init,
             dropout=args.fusion_dropout,
             alf_use_cls=args.alf_use_cls,
+            fusion_query_layer=args.fusion_query_layer,
         ).to(device).to(torch.bfloat16)
         fusion.requires_grad_(True)
         print(f"Multi-layer fusion: type={args.fusion_type} "
@@ -733,6 +734,11 @@ def parse_args():
     p.add_argument("--fusion_dropout", type=float, default=0.0,
                    help="Dropout inside the fusion module (cross_attention / "
                         "adaptive image conditioning).")
+    p.add_argument("--fusion_query_layer", type=int, default=None,
+                   help="cross_attention only: use this tapped hidden_states layer index "
+                        "as the attention QUERY instead of the final-layer trunk (must be "
+                        "one of --fusion_layers). Tests querying from a quality-rich "
+                        "intermediate layer rather than the semantically-invariant output.")
     p.add_argument("--alf_use_cls", action="store_true",
                    help="ALF only: use CLS+AP summary tokens per layer (faithful for "
                         "CLS-bearing backbones like CLIP/DINO). Default AP-only (SigLIP2 "
