@@ -393,6 +393,9 @@ def main():
                    help="cap images per split for a quick smoke test")
     p.add_argument("--breakdown", choices=["group", "type", "both"], default="both",
                    help="synthetic-set distortion breakdown granularity (KADID/TID)")
+    p.add_argument("--complementarity", action="store_true",
+                   help="pairwise layer complementarity (mean-pool): error correlation "
+                        "and concat-SRCC gain -- are two good layers redundant or additive?")
     # learned attention probe (PE-style); runs in addition to the linear probe.
     p.add_argument("--attention", action="store_true",
                    help="also fit a learned attention-pool probe on selected layers")
@@ -526,6 +529,14 @@ def main():
 
     _try_plot(args, rows, te_preds, yte, layer_indices, facets)
 
+    # ---- pairwise layer complementarity (mean-pool) ----
+    if args.complementarity:
+        mean_preds = {l: te_preds[("mean", l)] for l in layer_indices}
+        mean_srcc = {r["layer"]: r["srcc"] for r in rows if r["pooling"] == "mean"}
+        complementarity_analysis(args.out_dir, args.dataset, layer_indices,
+                                 tr_mean, va_mean, te_mean, ytr, yva, yte,
+                                 mean_preds, mean_srcc)
+
 
 def _try_plot(args, rows, te_preds, yte, layer_indices, facets):
     """Best-effort matplotlib figures; never blocks CSV output."""
@@ -576,6 +587,79 @@ def _try_plot(args, rows, te_preds, yte, layer_indices, facets):
         plt.title(f"{args.dataset}: SRCC by distortion {fname} (mean-pool)")
         plt.tight_layout()
         out = os.path.join(args.out_dir, f"{args.dataset}_heatmap_{fname}.png")
+        plt.savefig(out, dpi=150); print(f"Wrote {out}")
+
+
+# ---------------------------------------------------------------------------
+# Pairwise layer complementarity (mean-pool linear probe). Answers what a
+# per-layer probe can't: are two well-probing layers *redundant* (same MOS info)
+# or *complementary* (combining helps)? Two measures, both L x L:
+#   (1) error correlation  -- corr of per-image errors; low = complementary.
+#   (2) concat gain        -- SRCC([A;B]) - max(SRCC(A), SRCC(B)); >0 = additive.
+# ---------------------------------------------------------------------------
+def complementarity_analysis(out_dir, dataset, layer_indices, tr, va, te,
+                             ytr, yva, yte, mean_preds, mean_srcc):
+    """``mean_preds[layer]`` = per-layer test predictions; ``mean_srcc[layer]`` =
+    per-layer test SRCC; ``tr/va/te`` = ``[N, L, D]`` mean-pooled features."""
+    L = len(layer_indices)
+    errs = [mean_preds[l] - yte for l in layer_indices]
+    n_pairs = L * (L - 1) // 2
+    print(f"Complementarity: {n_pairs} layer pairs (concat refit) ...")
+    errcorr, gain, rows, done = np.eye(L), np.zeros((L, L)), [], 0
+    for a in range(L):
+        for b in range(a + 1, L):
+            ec = pearsonr(errs[a], errs[b])[0]
+            s_ab, _, _ = ridge_probe(
+                np.concatenate([tr[:, a], tr[:, b]], axis=1), ytr,
+                np.concatenate([va[:, a], va[:, b]], axis=1), yva,
+                np.concatenate([te[:, a], te[:, b]], axis=1), yte)
+            la, lb = layer_indices[a], layer_indices[b]
+            g = s_ab - max(mean_srcc[la], mean_srcc[lb])
+            errcorr[a, b] = errcorr[b, a] = ec
+            gain[a, b] = gain[b, a] = g
+            rows.append({"layer_a": la, "layer_b": lb, "srcc_a": mean_srcc[la],
+                         "srcc_b": mean_srcc[lb], "srcc_ab": s_ab,
+                         "concat_gain": g, "err_corr": ec})
+            done += 1
+            if done % 50 == 0:
+                print(f"  ...{done}/{n_pairs} pairs", flush=True)
+
+    path = os.path.join(out_dir, f"{dataset}_complementarity.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["layer_a", "layer_b", "srcc_a", "srcc_b",
+                                          "srcc_ab", "concat_gain", "err_corr"])
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Wrote {path}")
+    _plot_complementarity(out_dir, dataset, layer_indices, errcorr, gain)
+
+
+def _plot_complementarity(out_dir, dataset, layer_indices, errcorr, gain):
+    """Best-effort L x L heatmaps; never blocks the CSV."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  # pragma: no cover
+        print(f"(skipping complementarity plots: {e})")
+        return
+    for mat, name, title in [
+        (errcorr, "errcorr", "error correlation (low = complementary)"),
+        (gain, "concatgain", "concat SRCC gain over best single layer (>0 = additive)"),
+    ]:
+        plt.figure(figsize=(7.5, 6))
+        if name == "concatgain":
+            vmax = float(np.nanmax(np.abs(gain))) or 1e-6
+            im = plt.imshow(mat, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+        else:
+            im = plt.imshow(mat, cmap="viridis")
+        plt.colorbar(im)
+        plt.xticks(range(len(layer_indices)), layer_indices, fontsize=7)
+        plt.yticks(range(len(layer_indices)), layer_indices, fontsize=7)
+        plt.xlabel("layer"); plt.ylabel("layer")
+        plt.title(f"{dataset}: {title}")
+        plt.tight_layout()
+        out = os.path.join(out_dir, f"{dataset}_complementarity_{name}.png")
         plt.savefig(out, dpi=150); print(f"Wrote {out}")
 
 
