@@ -62,6 +62,7 @@ read -ra GPU_ARR <<< "$GPUS"
 read -ra SEED_ARR <<< "$SEEDS"
 read -ra MODEL_ARR <<< "$MODELS"
 NGPU=${#GPU_ARR[@]}
+SWEEP_TS="$(date +%Y%m%d_%H%M%S)"   # stamps log names so re-runs don't overwrite
 
 # ---- build the job list (model | dataset | seed) ---------------------------
 JOBS=()
@@ -90,7 +91,7 @@ dispatch() {
       IFS='|' read -r model ds seed <<< "$job"
       local mshort="${model##*/}"          # short backbone name for the tag
       local tag="${mshort}_seed${seed}"
-      local log="probe_out/logs/${ds}_${tag}_gpu${gpu}.log"
+      local log="probe_out/logs/${ds}_${tag}_gpu${gpu}_${SWEEP_TS}.log"
       echo "[GPU $gpu] START $mshort $ds seed=$seed -> $log"
       if CUDA_VISIBLE_DEVICES="$gpu" python probe_layers.py \
             --model_id "$model" --dataset "$ds" --seed "$seed" --tag "$tag" $EXTRA > "$log" 2>&1; then
