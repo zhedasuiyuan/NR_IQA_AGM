@@ -32,8 +32,9 @@ cd "$(dirname "$0")"
 DATASETS="${DATASETS:-KADID10K KonIQ_10K}"
 GPUS="${GPUS:-0 1 2}"
 EPOCHS="${EPOCHS:-15}"
-SEED="${SEED:-42}"
 PEFT="${PEFT:-LoRA}"       # same backbone-adaptation for every run -> isolates fusion
+# NOTE: train.py has no --seed flag; the split seed is fixed in seed.py, so all
+# runs share one deterministic split (fine -- only the fusion config varies).
 K="${K:-5}"               # target selected-set size
 
 read -ra DS_ARR  <<< "$DATASETS"
@@ -77,7 +78,7 @@ for ds in "${DS_ARR[@]}"; do
 done
 [ ${#JOBS[@]} -eq 0 ] && { echo "No jobs to run."; exit 1; }
 
-echo "Jobs: ${#JOBS[@]}  |  GPUs: $GPUS  |  epochs=$EPOCHS peft=$PEFT seed=$SEED"
+echo "Jobs: ${#JOBS[@]}  |  GPUs: $GPUS  |  epochs=$EPOCHS peft=$PEFT"
 echo
 
 # ---- one worker per GPU; round-robin ---------------------------------------
@@ -90,7 +91,7 @@ dispatch() {
       local log="pilot_out/${stage}.log"
       echo "[GPU $gpu] START $ds $label -> $log"
       if CUDA_VISIBLE_DEVICES="$gpu" python train.py \
-            --dataset "$ds" --peft_method "$PEFT" --epochs "$EPOCHS" --seed "$SEED" \
+            --dataset "$ds" --peft_method "$PEFT" --epochs "$EPOCHS" \
             --stage_name "$stage" $flags > "$log" 2>&1; then
         echo "[GPU $gpu] DONE  $ds $label"
       else
