@@ -389,6 +389,10 @@ def main():
     p.add_argument("--tag", type=str, default="",
                    help="appended to the run-folder name; keeps parallel runs of "
                         "the same dataset from colliding on an identical timestamp")
+    p.add_argument("--run_name", type=str, default="",
+                   help="explicit run-folder name (overrides the auto "
+                        "dataset_tag_timestamp); run_probes.sh sets this so the log "
+                        "can live inside the run folder")
     p.add_argument("--max_images", type=int, default=None,
                    help="cap images per split for a quick smoke test")
     p.add_argument("--breakdown", choices=["group", "type", "both"], default="both",
@@ -419,8 +423,11 @@ def main():
     args = p.parse_args()
 
     # Per-run subfolder so repeated experiments don't overwrite each other.
-    tag = f"_{args.tag}" if args.tag else ""
-    run_id = f"{args.dataset}{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
+    if args.run_name:  # run_probes.sh names it so the log can live in the folder
+        run_id = args.run_name
+    else:
+        tag = f"_{args.tag}" if args.tag else ""
+        run_id = f"{args.dataset}{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
     args.out_dir = os.path.join(args.out_dir, run_id)
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"Run outputs -> {args.out_dir}")

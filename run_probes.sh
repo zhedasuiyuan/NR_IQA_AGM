@@ -62,7 +62,6 @@ read -ra GPU_ARR <<< "$GPUS"
 read -ra SEED_ARR <<< "$SEEDS"
 read -ra MODEL_ARR <<< "$MODELS"
 NGPU=${#GPU_ARR[@]}
-SWEEP_TS="$(date +%Y%m%d_%H%M%S)"   # stamps log names so re-runs don't overwrite
 
 # ---- build the job list (model | dataset | seed) ---------------------------
 JOBS=()
@@ -74,7 +73,7 @@ for model in "${MODEL_ARR[@]}"; do
   done
 done
 
-mkdir -p probe_out/logs
+mkdir -p probe_out
 echo "Models:   $MODELS"
 echo "Datasets: $DATASETS"
 echo "Seeds:    $SEEDS"
@@ -89,12 +88,15 @@ dispatch() {
   for job in "${JOBS[@]}"; do
     if (( idx % NGPU == slot )); then
       IFS='|' read -r model ds seed <<< "$job"
-      local mshort="${model##*/}"          # short backbone name for the tag
-      local tag="${mshort}_seed${seed}"
-      local log="probe_out/logs/${ds}_${tag}_gpu${gpu}_${SWEEP_TS}.log"
+      local mshort="${model##*/}"          # short backbone name
+      local ts; ts="$(date +%Y%m%d_%H%M%S)"
+      local run_id="${ds}_${mshort}_seed${seed}_${ts}"
+      local rundir="probe_out/${run_id}"
+      mkdir -p "$rundir"                    # pre-create so the log lives in the run folder
+      local log="${rundir}/run.log"
       echo "[GPU $gpu] START $mshort $ds seed=$seed -> $log"
       if CUDA_VISIBLE_DEVICES="$gpu" python probe_layers.py \
-            --model_id "$model" --dataset "$ds" --seed "$seed" --tag "$tag" $EXTRA > "$log" 2>&1; then
+            --model_id "$model" --dataset "$ds" --seed "$seed" --run_name "$run_id" $EXTRA > "$log" 2>&1; then
         echo "[GPU $gpu] DONE  $mshort $ds seed=$seed"
       else
         echo "[GPU $gpu] FAIL  $mshort $ds seed=$seed (see $log)"
@@ -109,4 +111,4 @@ for slot in "${!GPU_ARR[@]}"; do
 done
 wait
 echo
-echo "All jobs finished. Results under probe_out/, logs under probe_out/logs/."
+echo "All jobs finished. Each run's outputs + run.log are under probe_out/<run_id>/."
