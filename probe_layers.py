@@ -184,11 +184,16 @@ class AttnPool(nn.Module):
     def __init__(self, dim, num_heads=8):
         super().__init__()
         self.query = nn.Parameter(torch.randn(1, 1, dim) * dim ** -0.5)
+        # Normalize input tokens: layers differ a lot in activation scale, and
+        # attention scores scale with magnitude -- without this, some layers'
+        # heads train poorly, making the cross-layer curve bumpy/unstable.
+        self.in_norm = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(dim)
         self.fc = nn.Linear(dim, 1)
 
     def forward(self, tokens):  # tokens: [B, N, D]
+        tokens = self.in_norm(tokens)
         q = self.query.expand(tokens.shape[0], -1, -1)
         pooled, _ = self.attn(q, tokens, tokens)  # [B, 1, D]
         return self.fc(self.norm(pooled[:, 0])).squeeze(-1)  # [B]
@@ -215,12 +220,27 @@ def _attn_eval(probes, model, processor, dataset, layers, device, batch_size):
     return out
 
 
+def _aggregate_seeds(per_seed):
+    """Average per-layer results over seeds. ``per_seed`` is a list of
+    ``{layer: (srcc, plcc, preds)}``; returns ``{layer: (srcc_mean, plcc_mean,
+    preds_of_first_seed, srcc_std)}`` -- the std is the run-to-run variance that
+    makes single-seed curves bumpy."""
+    out = {}
+    for l in per_seed[0]:
+        srccs = np.array([r[l][0] for r in per_seed])
+        plccs = np.array([r[l][1] for r in per_seed])
+        out[l] = (float(srccs.mean()), float(plccs.mean()),
+                  per_seed[0][l][2], float(srccs.std()))
+    return out
+
+
 def attention_probe(model, processor, train_ds, val_ds, test_ds, layers, dim, device,
-                    batch_size, epochs, lr, num_heads, max_train, seed):
+                    batch_size, epochs, lr, num_heads, max_train, seed, n_seeds=1):
     """Train one :class:`AttnPool` per target layer (heads share each backbone
     forward), early-stop each head on its own val SRCC, and score on test.
+    Repeated over ``n_seeds`` to average out training variance.
 
-    Returns ``{layer: (test_srcc, test_plcc, test_preds)}``.
+    Returns ``{layer: (test_srcc_mean, test_plcc_mean, test_preds, test_srcc_std)}``.
     """
     tr = train_ds
     if max_train and len(train_ds) > max_train:
@@ -229,36 +249,40 @@ def attention_probe(model, processor, train_ds, val_ds, test_ds, layers, dim, de
         idx = np.random.default_rng(seed).permutation(len(train_ds))[:max_train]
         tr = Subset(train_ds, idx.tolist())
 
-    probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
-    opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
-    best_val = {l: -2.0 for l in layers}
-    best_state = {l: None for l in layers}
-
-    for ep in range(epochs):
-        for p in probes.values():
-            p.train()
-        for batch in DataLoader(tr, batch_size=batch_size, shuffle=True, num_workers=4):
-            pv = _to_pixel_values(processor, batch["image"], model, device)
-            with torch.no_grad():
-                feats, _ = extract_token_features(model, pv, layers)  # frozen backbone
-            y = batch["score"].to(device).float()
-            opt.zero_grad()
-            loss = sum(F.mse_loss(probes[str(l)](f.float()), y) for l, f in zip(layers, feats))
-            loss.backward()
-            opt.step()
-
-        val = _attn_eval(probes, model, processor, val_ds, layers, device, batch_size)
+    def _fit_once(seed_val):
+        torch.manual_seed(seed_val)
+        probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
+        opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
+        best_val = {l: -2.0 for l in layers}
+        best_state = {l: None for l in layers}
+        for ep in range(epochs):
+            for p in probes.values():
+                p.train()
+            for batch in DataLoader(tr, batch_size=batch_size, shuffle=True, num_workers=4):
+                pv = _to_pixel_values(processor, batch["image"], model, device)
+                with torch.no_grad():
+                    feats, _ = extract_token_features(model, pv, layers)  # frozen backbone
+                y = batch["score"].to(device).float()
+                opt.zero_grad()
+                loss = sum(F.mse_loss(probes[str(l)](f.float()), y) for l, f in zip(layers, feats))
+                loss.backward()
+                opt.step()
+            val = _attn_eval(probes, model, processor, val_ds, layers, device, batch_size)
+            for l in layers:
+                if val[l][0] > best_val[l]:
+                    best_val[l] = val[l][0]
+                    best_state[l] = copy.deepcopy(probes[str(l)].state_dict())
         for l in layers:
-            if val[l][0] > best_val[l]:
-                best_val[l] = val[l][0]
-                best_state[l] = copy.deepcopy(probes[str(l)].state_dict())
-        print(f"  [attn] epoch {ep + 1}/{epochs} val SRCC "
-              + " ".join(f"L{l}={val[l][0]:.3f}" for l in layers))
+            if best_state[l] is not None:
+                probes[str(l)].load_state_dict(best_state[l])
+        return _attn_eval(probes, model, processor, test_ds, layers, device, batch_size)
 
-    for l in layers:
-        if best_state[l] is not None:
-            probes[str(l)].load_state_dict(best_state[l])
-    return _attn_eval(probes, model, processor, test_ds, layers, device, batch_size)
+    results = []
+    for s in range(n_seeds):
+        if n_seeds > 1:
+            print(f"  [attn] seed {s + 1}/{n_seeds}")
+        results.append(_fit_once(seed + s))
+    return _aggregate_seeds(results)
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +331,9 @@ def _attn_eval_mm(probes, mm, y, layers, device, batch_size):
 
 def attention_probe_cached(model, processor, train_ds, val_ds, test_ds, layers, dim, device,
                            batch_size, epochs, lr, num_heads, max_train, seed,
-                           cache_dir, run_id, keep_cache):
-    """Cached counterpart of :func:`attention_probe`. Same result, but the
-    backbone forwards once (per split) instead of every epoch."""
+                           cache_dir, run_id, keep_cache, n_seeds=1):
+    """Cached counterpart of :func:`attention_probe`. The backbone forwards once
+    (per split) instead of every epoch, so ``n_seeds`` head retrainings are cheap."""
     tr = train_ds
     if max_train and len(train_ds) > max_train:
         idx = np.random.default_rng(seed).permutation(len(train_ds))[:max_train]
@@ -324,16 +348,16 @@ def attention_probe_cached(model, processor, train_ds, val_ds, test_ds, layers, 
     tr_mm, ytr = _build_layer_cache(model, processor, tr, layers, device, batch_size, tr_path)
     va_mm, yva = _build_layer_cache(model, processor, val_ds, layers, device, batch_size, va_path)
     print(f"  [attn] cache built ({(tr_mm.nbytes + va_mm.nbytes) / 1e9:.0f} GB); "
-          f"training heads for {epochs} epochs")
-
-    probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
-    opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
-    best_val = {l: -2.0 for l in layers}
-    best_state = {l: None for l in layers}
-    rng = np.random.default_rng(seed)
+          f"training heads for {epochs} epochs x {n_seeds} seed(s)")
     N = tr_mm.shape[0]
 
-    try:
+    def _fit_once(seed_val):
+        torch.manual_seed(seed_val)
+        probes = nn.ModuleDict({str(l): AttnPool(dim, num_heads) for l in layers}).to(device).float()
+        opt = torch.optim.Adam(probes.parameters(), lr=lr, weight_decay=1e-4)
+        best_val = {l: -2.0 for l in layers}
+        best_state = {l: None for l in layers}
+        rng = np.random.default_rng(seed_val)
         for ep in range(epochs):
             for p in probes.values():
                 p.train()
@@ -347,14 +371,22 @@ def attention_probe_cached(model, processor, train_ds, val_ds, test_ds, layers, 
                            for li, l in enumerate(layers))
                 loss.backward()
                 opt.step()
-
             val = _attn_eval_mm(probes, va_mm, yva, layers, device, batch_size)
             for l in layers:
                 if val[l][0] > best_val[l]:
                     best_val[l] = val[l][0]
                     best_state[l] = copy.deepcopy(probes[str(l)].state_dict())
-            print(f"  [attn] epoch {ep + 1}/{epochs} val SRCC "
-                  + " ".join(f"L{l}={val[l][0]:.3f}" for l in layers))
+        for l in layers:
+            if best_state[l] is not None:
+                probes[str(l)].load_state_dict(best_state[l])
+        return _attn_eval(probes, model, processor, test_ds, layers, device, batch_size)  # test live
+
+    try:
+        results = []
+        for s in range(n_seeds):
+            if n_seeds > 1:
+                print(f"  [attn] seed {s + 1}/{n_seeds}")
+            results.append(_fit_once(seed + s))
     finally:
         del tr_mm, va_mm  # release memmaps before deleting the files
         if not keep_cache:
@@ -367,12 +399,7 @@ def attention_probe_cached(model, processor, train_ds, val_ds, test_ds, layers, 
                 os.rmdir(run_cache)
             except OSError:
                 pass
-
-    for l in layers:
-        if best_state[l] is not None:
-            probes[str(l)].load_state_dict(best_state[l])
-    # test scored live (one forward, not cached)
-    return _attn_eval(probes, model, processor, test_ds, layers, device, batch_size)
+    return _aggregate_seeds(results)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +436,9 @@ def main():
     p.add_argument("--attn_topk", type=int, default=0,
                    help="restrict to the top-k linear-probe layers + last layer; 0 = all layers")
     p.add_argument("--attn_epochs", type=int, default=20)
+    p.add_argument("--attn_seeds", type=int, default=1,
+                   help="retrain each layer's head over N seeds and report mean+/-std "
+                        "(smooths run-to-run bumpiness; ~free with --attn_cache_dir)")
     p.add_argument("--attn_lr", type=float, default=1e-3)
     p.add_argument("--attn_heads", type=int, default=8)
     p.add_argument("--attn_max_train", type=int, default=0,
@@ -476,7 +506,7 @@ def main():
     for name, (Xtr, Xva, Xte) in variants.items():
         for li, layer in enumerate(layer_indices):
             srcc, plcc, pred = ridge_probe(Xtr[:, li], ytr, Xva[:, li], yva, Xte[:, li], yte)
-            rows.append({"pooling": name, "layer": layer, "srcc": srcc, "plcc": plcc})
+            rows.append({"pooling": name, "layer": layer, "srcc": srcc, "plcc": plcc, "srcc_std": 0.0})
             te_preds[(name, layer)] = pred
             print(f"  [{name:6s}] layer {layer:2d}/{H}  SRCC={srcc:.4f}  PLCC={plcc:.4f}")
 
@@ -498,18 +528,20 @@ def main():
                   args.attn_epochs, args.attn_lr, args.attn_heads,
                   args.attn_max_train or None, args.seed)
         if args.attn_cache_dir:
-            res = attention_probe_cached(*common, args.attn_cache_dir, run_id, args.keep_cache)
+            res = attention_probe_cached(*common, args.attn_cache_dir, run_id,
+                                         args.keep_cache, args.attn_seeds)
         else:
-            res = attention_probe(*common)
+            res = attention_probe(*common, args.attn_seeds)
         for layer in attn_layers:
-            srcc, plcc, pred = res[layer]
-            rows.append({"pooling": "attention", "layer": layer, "srcc": srcc, "plcc": plcc})
+            srcc, plcc, pred, srcc_std = res[layer]
+            rows.append({"pooling": "attention", "layer": layer, "srcc": srcc,
+                         "plcc": plcc, "srcc_std": srcc_std})
             te_preds[("attention", layer)] = pred
-            print(f"  [attn  ] layer {layer:2d}/{H}  SRCC={srcc:.4f}  PLCC={plcc:.4f}")
+            print(f"  [attn  ] layer {layer:2d}/{H}  SRCC={srcc:.4f}±{srcc_std:.4f}  PLCC={plcc:.4f}")
 
     overall_csv = os.path.join(args.out_dir, f"{args.dataset}_layerwise.csv")
     with open(overall_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pooling", "layer", "srcc", "plcc"])
+        writer = csv.DictWriter(f, fieldnames=["pooling", "layer", "srcc", "plcc", "srcc_std"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {overall_csv}")
@@ -561,14 +593,17 @@ def _try_plot(args, rows, te_preds, yte, layer_indices, facets):
         xs = [r["layer"] for r in rows if r["pooling"] == name]
         ys = [r["srcc"] for r in rows if r["pooling"] == name]
         plt.plot(xs, ys, marker="o", label=f"{name}-pool")
-    attn = sorted((r["layer"], r["srcc"]) for r in rows if r["pooling"] == "attention")
+    attn = sorted((r["layer"], r["srcc"], r.get("srcc_std", 0.0))
+                  for r in rows if r["pooling"] == "attention")
     if attn:
-        axs, ays = zip(*attn)
+        axs, ays, astd = (np.array(z) for z in zip(*attn))
         if len(axs) == len(layer_indices):  # full curve -> line
             plt.plot(axs, ays, marker="o", color="crimson", label="attention (learned)")
         else:  # a few selected layers -> markers
             plt.scatter(axs, ays, marker="s", s=70, color="crimson", zorder=5,
                         label="attention (learned)")
+        if (astd > 0).any():  # +/- std band from --attn_seeds
+            plt.fill_between(axs, ays - astd, ays + astd, color="crimson", alpha=0.2)
     plt.xlabel("layer"); plt.ylabel("test SRCC"); plt.legend()
     plt.title(f"{args.dataset}: layer-wise IQA probe")
     plt.grid(alpha=0.3); plt.tight_layout()
