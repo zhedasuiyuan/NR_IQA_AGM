@@ -4,14 +4,17 @@
 # hypothesis: the best attention QUERY is a quality-rich intermediate layer, not
 # the semantically-invariant final-layer trunk.
 #
-# K/V = ALL layers for every run (fusion_stride 1) -- so this does NOT depend on
-# the (still-unvalidated) layer selection; only the query layer varies.
+# K/V = all layers EXCEPT the query layer (fusion_stride 1, query layer excluded)
+# -- so this does NOT depend on the (still-unvalidated) layer selection; only the
+# query layer varies, and each run is symmetric (query from q, K/V = the rest).
 #
 # Comparison points:
-#   * per query layer q: cross-attention, all layers, query = layer q  (the sweep)
-#   * ALF, all layers, learned query (one run per dataset, added here)
-#   * B_allattn (cross-attention, all layers, TRUNK query) -- in run_pilot.sh, NOT re-run
-# So: does an intermediate query beat ALF's learned query and the trunk query?
+#   * per query layer q: cross-attention, query = layer q, K/V = all others  (sweep)
+#   * q = the last layer (e.g. 27): the FINAL-LAYER baseline, done consistently
+#     with exclusion -- this is the baseline, NOT run_pilot's B_allattn (which
+#     keeps the last block in its K/V and so isn't comparable once we exclude).
+#   * ALF, all layers, learned query (one run per dataset).
+# So: does an intermediate query beat the final-layer query and ALF's learned query?
 #
 # Results -> query_out/query_results.csv.
 #
@@ -100,8 +103,8 @@ echo
 python - "$out" <<'PY'
 import csv, sys
 from collections import defaultdict
-best = defaultdict(lambda: (-2.0, None))   # best cross-attention query layer
-alf = {}                                   # ALF reference
+pts = defaultdict(list)   # dataset -> [(query_layer_int, srcc)]
+alf = {}                  # dataset -> ALF srcc
 for r in csv.DictReader(open(sys.argv[1])):
     try:
         s = float(r["test_SRCC"])
@@ -110,13 +113,17 @@ for r in csv.DictReader(open(sys.argv[1])):
     ds, q = r["dataset"], r["query_layer"]
     if q == "alf":
         alf[ds] = s
-    elif s > best[ds][0]:
-        best[ds] = (s, q)
-for ds in sorted(best):
-    s, q = best[ds]
+    else:
+        pts[ds].append((int(q), s))
+for ds in sorted(pts):
+    last_q, last_s = max(pts[ds], key=lambda t: t[0])   # final-layer baseline (largest q)
+    best_q, best_s = max(pts[ds], key=lambda t: t[1])   # best query layer
     a = alf.get(ds)
-    a_str = f"ALF(learned)={a:.4f}" if a is not None else "ALF=NA"
-    verdict = "beats ALF" if (a is None or s > a) else "loses to ALF"
-    print(f"  {ds}: best query L{q} test SRCC {s:.4f}  |  {a_str}  ({verdict})")
-    print(f"       intermediate + > run_pilot B_allattn (trunk query) => hypothesis holds")
+    a_str = f"ALF={a:.4f}" if a is not None else "ALF=NA"
+    vs_last = "beats" if best_s > last_s else "<="
+    vs_alf = "beats" if (a is None or best_s > a) else "<="
+    print(f"  {ds}: best query L{best_q}={best_s:.4f}  |  final-layer L{last_q}={last_s:.4f} "
+          f"({vs_last})  |  {a_str} ({vs_alf})")
+    if best_q != last_q and best_s > last_s:
+        print("       => an intermediate query beats the final-layer query: hypothesis holds")
 PY

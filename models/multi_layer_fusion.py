@@ -353,13 +353,16 @@ class TokenCrossAttentionFusion(nn.Module):
 
     def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor,
                 query: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if len(layer_features) != self.num_layers:
+        # Default: query = trunk, K/V = all tapped layers. When an intermediate
+        # query is used (via MultiLayerFusion), the caller passes ``query`` and a
+        # K/V list with that layer already removed -- so the count is L-1 and the
+        # strict check is skipped.
+        if query is None and len(layer_features) != self.num_layers:
             raise ValueError(f"expected {self.num_layers} layers, got {len(layer_features)}")
-        kv = self.kv_norm(torch.cat(layer_features, dim=1))   # [B, L*N, D]
-        # Query source: the trunk (final layer) by default, or an intermediate
-        # layer's tokens when given -- only changes WHERE attention looks; the
-        # result is still residual-added to the trunk (native_pool expects it,
-        # and zero-init out_proj keeps step-0 identity regardless of query).
+        kv = self.kv_norm(torch.cat(layer_features, dim=1))   # [B, (L or L-1)*N, D]
+        # Query source only changes WHERE attention looks; the result is still
+        # residual-added to the trunk (native_pool expects it, and zero-init
+        # out_proj keeps step-0 identity regardless of query).
         q_src = trunk if query is None else query
         q = self.q_proj(self.q_norm(q_src))                   # [B, N, D]
         attn_out, _ = self.attn(query=q, key=self.k_proj(kv), value=self.v_proj(kv))
@@ -457,6 +460,9 @@ class MultiLayerFusion(nn.Module):
                     f"fusion_query_layer={fusion_query_layer} must be one of the tapped "
                     f"layers {self.layer_indices}; add it via --fusion_layers."
                 )
+            if len(self.layer_indices) < 2:
+                raise ValueError("fusion_query_layer needs >=2 tapped layers "
+                                 "(the query layer is excluded from the K/V).")
             self._query_pos = self.layer_indices.index(fusion_query_layer)
         else:
             self._query_pos = None
@@ -526,8 +532,10 @@ class MultiLayerFusion(nn.Module):
         )
 
     def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
-        if self._query_pos is not None:  # cross_attention with an intermediate query
-            return self.fuser(layer_features, trunk, query=layer_features[self._query_pos])
+        if self._query_pos is not None:  # query from that layer; EXCLUDE it from K/V
+            q_src = layer_features[self._query_pos]
+            kv_feats = layer_features[:self._query_pos] + layer_features[self._query_pos + 1:]
+            return self.fuser(kv_feats, trunk, query=q_src)
         return self.fuser(layer_features, trunk)
 
     def save(self, path: str) -> None:
