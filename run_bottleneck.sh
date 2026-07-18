@@ -41,14 +41,21 @@ CACHE="${CACHE:-1}"                       # 0 = no cache: forward backbone per e
                                           #     (avoids disk I/O; re-forwards per config)
 CACHE_DIR="${CACHE_DIR:-/data/bneck_cache}"
 KEEP_CACHE="${KEEP_CACHE:-1}"             # 1 = keep the token cache (default); 0 = delete after sweep
-OUT="${OUT:-bneck_out/bneck_results.csv}"
+
+# Per-run output dir (mode + timestamp) so repeated / cache-vs-no-cache runs of
+# the same setup don't overwrite each other's logs and results table.
+MODE=$([ "$CACHE" = "1" ] && echo cache || echo nocache)
+RUN="${RUN:-$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="bneck_out/${MODE}_${RUN}"
+OUT="${OUT:-$RUN_DIR/bneck_results.csv}"
 
 read -ra MODEL_ARR <<< "$MODELS"
 read -ra DS_ARR  <<< "$DATASETS"
 read -ra GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
-mkdir -p bneck_out
+mkdir -p "$RUN_DIR"
 rm -f "$OUT"                              # fresh table; per-run rows are appended
+echo "Run outputs -> $RUN_DIR"
 
 # ---- summarizer configs: "summarizer|width" -------------------------------
 CONFIGS=("ap|1" "pma|1" "pma|2" "pma|4" "pma|8" "tome|2" "tome|4" "tome|8")
@@ -70,13 +77,13 @@ if [ "$CACHE" = "1" ]; then
         continue
       fi
       echo "[cache] ${m##*/} $ds -> build ($cr)"
+      clog="$RUN_DIR/cache_${m##*/}_${ds}.log"
       CUDA_VISIBLE_DEVICES="${GPU_ARR[0]}" python bottleneck_probe.py \
         --model_id "$m" --dataset "$ds" --seed "$SEED" --cache_dir "$CACHE_DIR" \
-        --batch_size "$BS" --build_cache_only \
-        > "bneck_out/cache_${m##*/}_${ds}.log" 2>&1
+        --batch_size "$BS" --build_cache_only > "$clog" 2>&1
       rc=$?
       # rc 137 = SIGKILL (usually OOM: check `dmesg | tail`); 124 = launcher timeout.
-      [ $rc -ne 0 ] && { echo "  FAIL rc=$rc (see bneck_out/cache_${m##*/}_${ds}.log)"; exit 1; }
+      [ $rc -ne 0 ] && { echo "  FAIL rc=$rc (see $clog)"; exit 1; }
     done
   done
 else
@@ -95,7 +102,7 @@ dispatch() {
   for job in "${JOBS[@]}"; do
     if (( idx % NGPU == slot )); then
       IFS='|' read -r m ds summ width <<< "$job"
-      local log="bneck_out/${m##*/}_${ds}_${summ}${width}.log"
+      local log="$RUN_DIR/${m##*/}_${ds}_${summ}${width}.log"
       echo "[GPU $gpu] START ${m##*/} $ds $summ w=$width"
       CUDA_VISIBLE_DEVICES="$gpu" python bottleneck_probe.py \
             --model_id "$m" --dataset "$ds" --seed "$SEED" --summarizer "$summ" --width "$width" \
