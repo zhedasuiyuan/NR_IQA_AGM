@@ -212,7 +212,125 @@ complementary. Distinct from PE: PE lifts via large-scale distillation into a
 TIP/TMM/WACV-tier: a thorough probing study + a well-motivated aggregation +
 honest ablations is sufficient — the probing is the novelty insurance even if the
 module is modest. The value is a **mechanistic explanation** of why pooled
-foundation-model features are wrong for IQA, plus the corrective.
+foundation-model features are wrong for IQA, plus the corrective. For the
+**top-tier (ICLR/CVPR)** path — breadth beyond IQA + a mechanism — see
+*Scaling to a top-tier venue* below (Part 3).
+
+## Part 3 — the per-layer summarization-bottleneck study (`bottleneck_probe.py`)
+
+Part 2 aggregates *whole layers*. Part 3 asks a sharper question one level down:
+**how should each layer be summarized before it is fused?**
+
+The motivation is ALF (*"Beyond the Final Layer: Attentive Multi-Layer Fusion"*,
+[arXiv:2601.09322](https://arxiv.org/abs/2601.09322), ICML'26): it fuses all
+layers but summarizes each one as **CLS + AP** (average-pool) — one or two vectors
+per layer — and *explicitly acknowledges* the limitation that "spatial averaging
+may neglect fine-grained spatial details ... precise localization." That is
+exactly the signal NR-IQA needs (local blur, blocking, banding). So: **does
+widening the per-layer summary recover IQA-relevant local-distortion detail?**
+
+### Design (one head, one variable)
+
+A single trainable readout: **per-layer summarizer → +layer embedding →
+cross-layer PMA (one learned query) → linear MOS**. Everything downstream of the
+summarizer is identical across arms, so the comparison isolates the summarizer.
+CLS rides along in *every* arm (`--keep_cls`, default on) as a constant add-on —
+so the variable under study is purely the **patch-summary width**:
+
+| arm (`--summarizer`) | per-layer summary | width knob |
+|---|---|---|
+| `ap` | CLS + mean patch token | — (**== ALF baseline**) |
+| `pma` | CLS + `k` learned-query tokens (Set Transformer PMA_k) | `k` = `--width` |
+| `tome` | CLS + `r` ToMe-merged tokens (Bolya et al., parameter-free) | `r` = `--width` |
+
+Patch tokens exclude any leading CLS/register tokens (auto-detected as
+`Ntok − num_patches`); the prefix is excluded from `pma`/`tome` so ToMe never
+merges the out-of-distribution CLS/register token and budget accounting stays
+clean. On SigLIP2 (no CLS) the CLS prepend is a no-op, so `ap` == plain mean.
+
+Reads: `pma k=1` vs `ap` = *learned vs mean single patch token* (ALF's motivation,
+applied per layer); `k>1`/`r>1` vs `ap` = *does width matter*; `pma` vs `tome` at
+matched width = *learned vs parameter-free allocation*.
+
+### Infra
+
+Reuses the Part-1 fp16 all-layer cache. `--cache_dir` is **optional**: empty ⇒
+*no cache*, forwarding the frozen backbone on the fly each epoch (only the current
+batch on GPU, zero disk) — use when the ~0.5 TB cache is disk-I/O-bound. The build
+now flushes periodically to avoid dirty-page OOM on huge caches. `run_bottleneck.sh`
+exposes `MODELS` (cross-backbone), `CACHE=0` (no cache), `BS`, `SEED`, and skips a
+cache build whose split files already exist.
+
+```bash
+# smoke (caps splits, ~15 GB cache)
+python bottleneck_probe.py --dataset KADID10K --summarizer pma --width 4 \
+  --cache_dir /data/bneck_cache --max_images 800
+# full sweep (ap + pma{1,2,4,8} + tome{2,4,8}) x datasets x backbones
+./run_bottleneck.sh                          # cached
+CACHE=0 BS=8 ./run_bottleneck.sh             # no-cache (backbone forwards per epoch)
+```
+
+### Early results (indicative, not final)
+
+- **KADID10K, SigLIP2, 3 seeds:** `pma1` SRCC **0.9056**, `pma2` **0.9050**, vs
+  `ap1` **0.8387** — a large +0.067 gain for learned single-query pooling.
+  **Caution:** `pma1 ≈ pma2` ⇒ so far the win is *attention-vs-mean pooling per
+  layer*, **not** bottleneck *width*. If `pma4/8` and `tome` stay flat, the story
+  is "learned per-layer summarization," not "wider summary." Await the full table
+  + KonIQ before committing framing. Verify the `ap` arm's val curve converged
+  (same epochs/lr/early-stop as `pma`) before trusting the gap.
+- **Cross-attention aggregation (Part 2), separate run:** using an **intermediate
+  layer (L15) as the attention query** beats the last-layer/trunk query by
+  ~0.01 SRCC — a second readout-design choice ALF/vanilla fusion gets wrong here.
+
+## Scaling to a top-tier venue (ICLR / CVPR)
+
+**Honest bar.** IQA-only, however thorough, tops out around WACV/TIP/TMM. Top-tier
+needs **breadth + mechanism**: a finding that generalizes past one task and a
+*why*, not just a table of wins. The two findings above (learned per-layer
+summarization ≫ mean; intermediate-layer query > trunk query, both in the
+*frozen*-backbone regime) are the seeds; the following turns them into a
+top-tier-shaped paper.
+
+### Two framings
+
+**Framing A — "How to read out frozen vision foundation models" (ICLR-shaped).**
+A design-space study of the readout, not an IQA method: per-layer summarizer
+`{mean, CLS+AP, PMA-k, ToMe-r}` × cross-layer fusion `{learned query, trunk query,
+intermediate-layer query}` × layer set. Our findings are cells; the paper names
+the recipe that wins and *why*. Requires **tasks beyond IQA, stratified by
+locality** — IQA (local), aesthetics/AVA, distortion-type classification, a dense
+linear probe (depth/seg) — with the prediction that *the gain grows with task
+locality*. That trend, if it holds, is the memorable law. Evidence bar ≈ ALF's:
+3–4 backbones (SigLIP2/CLIP/DINOv2 + a scale point), ~10+ datasets.
+
+**Framing B — frozen-readout IQA method + analysis (CVPR-shaped).** Match/beat
+LoRA-finetuned and IQA SOTA (DEIQT, LoDa, TOPIQ) with a **frozen** backbone + tiny
+head; sell = efficiency (≈100× fewer trained params) + the probing analysis. Full
+7-dataset + cross-dataset tables. Harder: finetuned methods hit ~0.93+ on KADID,
+so SOTA tables are brutal — worse expected value than A.
+
+**Recommendation: Framing A.** The evidence already points there (readout choices,
+frozen regime, ALF as foil), the query-layer finding folds in naturally, and the
+mechanism experiments are cheap on the existing cache infra.
+
+### Mechanism experiments (what lifts it above an empirical recipe)
+
+1. **Locality-controlled synthetic experiment.** Distort a fraction `p` of the
+   image; mean-pool signal dilutes ∝ `p`, attention-pool should stay ~invariant.
+   Cheap, decisive, one figure — the *why* behind learned-pooling's win.
+2. **Attention-map analysis.** Does the learned query attend to the distorted
+   regions? Qualitative maps + quantitative attention-mass-on-distorted-patches.
+3. **Distortion-type × layer × summarizer breakdown** (Part-1 infra already emits
+   the facets).
+
+### Immediate next steps
+
+- Finish the sweep: **KonIQ + `tome` + width grid** — decides "width" vs "learned
+  pooling" framing.
+- Build the **locality-controlled synthetic** experiment on the cache infra.
+- Add **one second task** (AVA aesthetics or distortion-type classification) —
+  cheap, reuses the whole pipeline, and is what turns IQA-only into breadth.
 
 ## Files
 
@@ -220,6 +338,8 @@ foundation-model features are wrong for IQA, plus the corrective.
 |---|---|
 | `probe_layers.py` | **New.** Frozen-backbone layer-wise probe: `extract_pooled`, `ridge_probe`, `AttnPool` + `attention_probe` (learned attention probe), `DISTORTION_GROUPS` + `_breakdown_facets` (group/type/level breakdown), CSV + matplotlib outputs. CLIP/DINOv2-compatible (processor fallback). |
 | `run_probes.sh` | **New.** Multi-GPU sweep: round-robins (model, dataset, seed) jobs across `GPUS`, per-job logs, `--tag` to keep run folders distinct. |
+| `bottleneck_probe.py` | **New (Part 3).** Per-layer summarization-bottleneck study: `Readout` (summarizer → cross-layer PMA → linear), summarizers `ap`/`pma`/`tome` (`tome_reduce` = parameter-free bipartite merge), CLS/register auto-detection, cached + live (`train_head` / `train_head_live`) training paths, `model`-tagged results CSV. |
+| `run_bottleneck.sh` | **New (Part 3).** Bottleneck sweep across `MODELS × DATASETS × {ap,pma,tome}`; `CACHE=0` no-cache mode, `BS`/`SEED` knobs, cache reuse + exit-code (`rc`) reporting. |
 | `dataset.py` | **New** `TID2013` class; registered in `_DATASET_CTORS` and `_REFERENCE_GROUPED`. |
 | `configs/default.py` | `TID2013` path in `_make_dataset_paths`. |
 
