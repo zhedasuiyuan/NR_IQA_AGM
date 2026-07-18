@@ -35,11 +35,12 @@ DATASETS="${DATASETS:-KADID10K KonIQ_10K}"
 GPUS="${GPUS:-0 1 2}"
 EPOCHS="${EPOCHS:-20}"
 SEEDS="${SEEDS:-3}"                       # avg out head-init variance (cache is free)
+SEED="${SEED:-42}"                        # split seed (cache path embeds it)
 BS="${BS:-16}"                           # per-step batch (reads [B,L,N,D] into GPU)
 CACHE="${CACHE:-1}"                       # 0 = no cache: forward backbone per epoch
                                           #     (avoids disk I/O; re-forwards per config)
 CACHE_DIR="${CACHE_DIR:-/data/bneck_cache}"
-KEEP_CACHE="${KEEP_CACHE:-0}"             # 1 = keep the (large) token cache after sweep
+KEEP_CACHE="${KEEP_CACHE:-1}"             # 1 = keep the token cache (default); 0 = delete after sweep
 OUT="${OUT:-bneck_out/bneck_results.csv}"
 
 read -ra MODEL_ARR <<< "$MODELS"
@@ -57,15 +58,25 @@ CACHE_FLAG=""
 [ "$CACHE" = "1" ] && CACHE_FLAG="--cache_dir $CACHE_DIR"
 
 # ---- phase 1: build one cache per (model, dataset) (serial; first GPU) ------
+# Skip a build whose 3 split files already exist (cache path mirrors
+# bottleneck_probe.py: <dir>/<ds>_s<seed>_<model-basename>/).
 if [ "$CACHE" = "1" ]; then
   echo "=== phase 1: build caches (serial) ==="
   for m in "${MODEL_ARR[@]}"; do
     for ds in "${DS_ARR[@]}"; do
-      echo "[cache] ${m##*/} $ds -> $CACHE_DIR"
+      cr="$CACHE_DIR/${ds}_s${SEED}_${m##*/}"
+      if [ -f "$cr/train.f16" ] && [ -f "$cr/val.f16" ] && [ -f "$cr/test.f16" ]; then
+        echo "[cache] ${m##*/} $ds -> reuse ($cr)"
+        continue
+      fi
+      echo "[cache] ${m##*/} $ds -> build ($cr)"
       CUDA_VISIBLE_DEVICES="${GPU_ARR[0]}" python bottleneck_probe.py \
-        --model_id "$m" --dataset "$ds" --cache_dir "$CACHE_DIR" --batch_size "$BS" \
-        --build_cache_only > "bneck_out/cache_${m##*/}_${ds}.log" 2>&1 \
-        || { echo "  FAIL (see bneck_out/cache_${m##*/}_${ds}.log)"; exit 1; }
+        --model_id "$m" --dataset "$ds" --seed "$SEED" --cache_dir "$CACHE_DIR" \
+        --batch_size "$BS" --build_cache_only \
+        > "bneck_out/cache_${m##*/}_${ds}.log" 2>&1
+      rc=$?
+      # rc 137 = SIGKILL (usually OOM: check `dmesg | tail`); 124 = launcher timeout.
+      [ $rc -ne 0 ] && { echo "  FAIL rc=$rc (see bneck_out/cache_${m##*/}_${ds}.log)"; exit 1; }
     done
   done
 else
@@ -86,13 +97,15 @@ dispatch() {
       IFS='|' read -r m ds summ width <<< "$job"
       local log="bneck_out/${m##*/}_${ds}_${summ}${width}.log"
       echo "[GPU $gpu] START ${m##*/} $ds $summ w=$width"
-      if CUDA_VISIBLE_DEVICES="$gpu" python bottleneck_probe.py \
-            --model_id "$m" --dataset "$ds" --summarizer "$summ" --width "$width" \
+      CUDA_VISIBLE_DEVICES="$gpu" python bottleneck_probe.py \
+            --model_id "$m" --dataset "$ds" --seed "$SEED" --summarizer "$summ" --width "$width" \
             --epochs "$EPOCHS" --seeds "$SEEDS" --batch_size "$BS" $CACHE_FLAG \
-            --out_csv "$OUT" > "$log" 2>&1; then
+            --out_csv "$OUT" > "$log" 2>&1
+      rc=$?
+      if [ $rc -eq 0 ]; then
         echo "[GPU $gpu] DONE  ${m##*/} $ds $summ w=$width"
-      else
-        echo "[GPU $gpu] FAIL  ${m##*/} $ds $summ w=$width (see $log)"
+      else  # rc 137 = SIGKILL/OOM (check `dmesg | tail`); 124 = launcher timeout
+        echo "[GPU $gpu] FAIL rc=$rc ${m##*/} $ds $summ w=$width (see $log)"
       fi
     fi
     idx=$((idx + 1))

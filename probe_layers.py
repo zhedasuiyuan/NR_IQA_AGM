@@ -311,6 +311,9 @@ def _build_layer_cache(model, processor, dataset, layers, device, batch_size, pa
         if (bi + 1) % 25 == 0:  # visible progress -- the build is I/O-heavy and silent
             gb = start * L * arr.shape[2] * arr.shape[3] * 2 / 1e9
             print(f"    ...{start}/{N} cached ({gb:.0f} GB, {time.time() - t0:.0f}s)", flush=True)
+            # Drain dirty pages periodically: without this a huge (~0.5 TB) cache
+            # accumulates dirty pages faster than writeback and OOM-kills the build.
+            mm.flush()
     mm.flush()  # force writeback of remaining dirty pages (can stall on a big cache)
     return mm, torch.cat(ys).numpy()
 
