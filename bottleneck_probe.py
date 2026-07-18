@@ -50,7 +50,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import pearsonr, spearmanr
-from torch.utils.data import Subset
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoImageProcessor, AutoModel, AutoProcessor
 
 from configs.default import MODEL_CONFIG, _make_dataset_paths
@@ -60,8 +60,9 @@ from models.multi_layer_fusion import (
     _vision_config,
     backbone_hidden_size,
     backbone_num_hidden_layers,
+    extract_token_features,
 )
-from probe_layers import _build_layer_cache
+from probe_layers import _build_layer_cache, _to_pixel_values
 
 
 def num_prefix_tokens(model, ntok):
@@ -229,6 +230,52 @@ def train_head(kind, width, dim, L, tr_mm, ytr, va_mm, yva, te_mm, yte,
     return ts, tp, best_val, T
 
 
+def train_head_live(kind, width, dim, L, model, processor, train_ds, val_ds, test_ds,
+                    layers, device, bs, epochs, lr, heads, seed, n_prefix, keep_cls):
+    """No-cache counterpart of :func:`train_head`: the frozen backbone forwards on
+    the fly each epoch (only the current batch's tokens on GPU, zero disk). Use
+    when the on-disk cache is I/O-bound; costs a backbone pass per epoch instead."""
+    torch.manual_seed(seed)
+    head = Readout(kind, dim, L, width, heads, n_prefix, keep_cls).to(device)
+    opt = torch.optim.Adam(head.parameters(), lr=lr, weight_decay=1e-4)
+
+    def stack(pv):  # [B,C,H,W] -> [B,L,N,D] on device
+        with torch.no_grad():
+            feats, _ = extract_token_features(model, pv, layers)
+        return torch.stack(feats, dim=1).float()
+
+    @torch.no_grad()
+    def ev(ds):
+        head.eval()
+        preds, ys = [], []
+        for batch in DataLoader(ds, batch_size=bs, shuffle=False, num_workers=4):
+            pv = _to_pixel_values(processor, batch["image"], model, device)
+            preds.append(head(stack(pv)).cpu())
+            ys.append(batch["score"].float())
+        pr, y = torch.cat(preds).numpy(), torch.cat(ys).numpy()
+        return spearmanr(pr, y)[0], pearsonr(pr, y)[0]
+
+    best_val, best_state = -2.0, None
+    for ep in range(epochs):
+        head.train()
+        for batch in DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=4):
+            pv = _to_pixel_values(processor, batch["image"], model, device)
+            y = batch["score"].to(device).float()
+            opt.zero_grad()
+            loss = F.mse_loss(head(stack(pv)), y)
+            loss.backward()
+            opt.step()
+        vs = ev(val_ds)[0]
+        if vs > best_val:
+            best_val, best_state = vs, copy.deepcopy(head.state_dict())
+    if best_state is not None:
+        head.load_state_dict(best_state)
+    patch_w = 1 if kind == "ap" else width
+    T = L * (patch_w + (1 if head.keep_cls else 0))
+    ts, tp = ev(test_ds)
+    return ts, tp, best_val, T
+
+
 # ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -247,8 +294,10 @@ def main():
     p.add_argument("--seeds", type=int, default=1, help="retrain over N seeds, report mean+/-std")
     p.add_argument("--seed", type=int, default=42, help="split seed (also base head seed)")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--cache_dir", type=str, required=True,
-                   help="fp16 all-layer token cache root, e.g. /data/bneck_cache")
+    p.add_argument("--cache_dir", type=str, default="",
+                   help="fp16 all-layer token cache root (e.g. /data/bneck_cache); "
+                        "empty -> no cache: forward the backbone on the fly each epoch "
+                        "(use when the cache is disk-I/O-bound)")
     p.add_argument("--max_images", type=int, default=None, help="cap all splits (smoke test)")
     p.add_argument("--build_cache_only", action="store_true", help="build cache and exit")
     p.add_argument("--out_csv", type=str, default="bneck_out/bneck_results.csv")
@@ -270,29 +319,44 @@ def main():
         cap = lambda ds: Subset(ds, list(range(min(args.max_images, len(ds)))))
         train_ds, val_ds, test_ds = cap(train_ds), cap(val_ds), cap(test_ds)
 
-    # Cache keyed by dataset+seed (+ smoke cap) so configs reuse one backbone pass.
-    tag = f"_cap{args.max_images}" if args.max_images is not None else ""
     model_tag = args.model_id.rstrip("/").split("/")[-1]
-    cache_root = os.path.join(args.cache_dir, f"{args.dataset}_s{args.seed}_{model_tag}{tag}")
-    ec = lambda ds, split: ensure_cache(model, processor, ds, layers, args.device,
-                                        args.batch_size, cache_root, split)
-    tr_mm, ytr = ec(train_ds, "train")
-    va_mm, yva = ec(val_ds, "val")
-    te_mm, yte = ec(test_ds, "test")
-    if args.build_cache_only:
-        print(f"Cache ready at {cache_root}")
-        return
+    common = (dim, H)  # shared head-shape args
 
-    n_prefix = num_prefix_tokens(model, tr_mm.shape[2])  # CLS/register tokens, 0 for SigLIP
+    if args.cache_dir:
+        # Cache keyed by dataset+seed (+ smoke cap) so configs reuse one backbone pass.
+        tag = f"_cap{args.max_images}" if args.max_images is not None else ""
+        cache_root = os.path.join(args.cache_dir, f"{args.dataset}_s{args.seed}_{model_tag}{tag}")
+        ec = lambda ds, split: ensure_cache(model, processor, ds, layers, args.device,
+                                            args.batch_size, cache_root, split)
+        tr_mm, ytr = ec(train_ds, "train")
+        va_mm, yva = ec(val_ds, "val")
+        te_mm, yte = ec(test_ds, "test")
+        if args.build_cache_only:
+            print(f"Cache ready at {cache_root}")
+            return
+        ntok = tr_mm.shape[2]
+        fit = lambda s: train_head(args.summarizer, args.width, *common, tr_mm, ytr,
+                                   va_mm, yva, te_mm, yte, args.device, args.batch_size,
+                                   args.epochs, args.lr, args.heads, s, n_prefix, args.keep_cls)
+    else:
+        if args.build_cache_only:
+            p.error("--build_cache_only requires --cache_dir")
+        # No cache: get Ntok from a single forward, then forward per epoch.
+        pv0 = _to_pixel_values(processor, train_ds[0]["image"].unsqueeze(0), model, args.device)
+        ntok = extract_token_features(model, pv0, layers[:1])[0][0].shape[1]
+        fit = lambda s: train_head_live(args.summarizer, args.width, *common, model,
+                                        processor, train_ds, val_ds, test_ds, layers,
+                                        args.device, args.batch_size, args.epochs, args.lr,
+                                        args.heads, s, n_prefix, args.keep_cls)
+
+    n_prefix = num_prefix_tokens(model, ntok)  # CLS/register tokens, 0 for SigLIP
     cls_on = args.keep_cls and n_prefix >= 1
-    print(f"[{args.dataset}] {args.summarizer} width={args.width} keep_cls={cls_on}  "
-          f"{H} layers, D={dim}, Ntok={tr_mm.shape[2]}, prefix={n_prefix} "
+    mode = "cached" if args.cache_dir else "live (no cache)"
+    print(f"[{args.dataset}] {args.summarizer} width={args.width} keep_cls={cls_on} [{mode}]  "
+          f"{H} layers, D={dim}, Ntok={ntok}, prefix={n_prefix} "
           f"({'CLS present' if n_prefix else 'no CLS'}), {args.seeds} seed(s), {args.epochs} epochs")
     t0 = time.time()
-    results = [train_head(args.summarizer, args.width, dim, H, tr_mm, ytr, va_mm, yva,
-                          te_mm, yte, args.device, args.batch_size, args.epochs,
-                          args.lr, args.heads, args.seed + s, n_prefix, args.keep_cls)
-               for s in range(args.seeds)]
+    results = [fit(args.seed + s) for s in range(args.seeds)]
     srccs = np.array([r[0] for r in results])
     plccs = np.array([r[1] for r in results])
     T = results[0][3]
@@ -304,9 +368,9 @@ def main():
     with open(args.out_csv, "a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["dataset", "summarizer", "width", "tokens", "test_SRCC",
+            w.writerow(["model", "dataset", "summarizer", "width", "tokens", "test_SRCC",
                         "test_SRCC_std", "test_PLCC", "val_SRCC"])
-        w.writerow([args.dataset, args.summarizer, args.width, T,
+        w.writerow([model_tag, args.dataset, args.summarizer, args.width, T,
                     f"{srccs.mean():.4f}", f"{srccs.std():.4f}",
                     f"{plccs.mean():.4f}", f"{max(r[2] for r in results):.4f}"])
     print(f"Appended -> {args.out_csv}")

@@ -20,22 +20,29 @@
 # round-robin across GPUs off the shared read-only cache.
 #
 # Usage:
-#   ./run_bottleneck.sh                         # KADID10K + KonIQ_10K, 3 GPUs
+#   ./run_bottleneck.sh                         # SigLIP2, KADID10K + KonIQ_10K, 3 GPUs
 #   SEEDS=3 EPOCHS=25 ./run_bottleneck.sh       # smoother curves
 #   DATASETS="KADID10K" GPUS="0" ./run_bottleneck.sh
+#   CACHE=0 ./run_bottleneck.sh                  # no disk cache (forward per epoch)
+#   MODELS="google/siglip2-so400m-patch16-512 openai/clip-vit-large-patch14 facebook/dinov2-large" \
+#     ./run_bottleneck.sh                        # cross-backbone breadth
 
 set -uo pipefail
 cd "$(dirname "$0")"
 
+MODELS="${MODELS:-google/siglip2-so400m-patch16-512}"   # space-separated HF ids
 DATASETS="${DATASETS:-KADID10K KonIQ_10K}"
 GPUS="${GPUS:-0 1 2}"
 EPOCHS="${EPOCHS:-20}"
 SEEDS="${SEEDS:-3}"                       # avg out head-init variance (cache is free)
 BS="${BS:-16}"                           # per-step batch (reads [B,L,N,D] into GPU)
+CACHE="${CACHE:-1}"                       # 0 = no cache: forward backbone per epoch
+                                          #     (avoids disk I/O; re-forwards per config)
 CACHE_DIR="${CACHE_DIR:-/data/bneck_cache}"
 KEEP_CACHE="${KEEP_CACHE:-0}"             # 1 = keep the (large) token cache after sweep
 OUT="${OUT:-bneck_out/bneck_results.csv}"
 
+read -ra MODEL_ARR <<< "$MODELS"
 read -ra DS_ARR  <<< "$DATASETS"
 read -ra GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
@@ -45,34 +52,47 @@ rm -f "$OUT"                              # fresh table; per-run rows are append
 # ---- summarizer configs: "summarizer|width" -------------------------------
 CONFIGS=("ap|1" "pma|1" "pma|2" "pma|4" "pma|8" "tome|2" "tome|4" "tome|8")
 
-# ---- phase 1: build one cache per dataset (serial; first GPU) --------------
-echo "=== phase 1: build caches (serial) ==="
-for ds in "${DS_ARR[@]}"; do
-  echo "[cache] $ds -> $CACHE_DIR"
-  CUDA_VISIBLE_DEVICES="${GPU_ARR[0]}" python bottleneck_probe.py \
-    --dataset "$ds" --cache_dir "$CACHE_DIR" --batch_size "$BS" --build_cache_only \
-    > "bneck_out/cache_${ds}.log" 2>&1 || { echo "  FAIL (see bneck_out/cache_${ds}.log)"; exit 1; }
-done
+# --cache_dir flag shared by both phases; empty in no-cache mode.
+CACHE_FLAG=""
+[ "$CACHE" = "1" ] && CACHE_FLAG="--cache_dir $CACHE_DIR"
+
+# ---- phase 1: build one cache per (model, dataset) (serial; first GPU) ------
+if [ "$CACHE" = "1" ]; then
+  echo "=== phase 1: build caches (serial) ==="
+  for m in "${MODEL_ARR[@]}"; do
+    for ds in "${DS_ARR[@]}"; do
+      echo "[cache] ${m##*/} $ds -> $CACHE_DIR"
+      CUDA_VISIBLE_DEVICES="${GPU_ARR[0]}" python bottleneck_probe.py \
+        --model_id "$m" --dataset "$ds" --cache_dir "$CACHE_DIR" --batch_size "$BS" \
+        --build_cache_only > "bneck_out/cache_${m##*/}_${ds}.log" 2>&1 \
+        || { echo "  FAIL (see bneck_out/cache_${m##*/}_${ds}.log)"; exit 1; }
+    done
+  done
+else
+  echo "=== no-cache mode (CACHE=0): backbone forwards on the fly each epoch ==="
+fi
 
 # ---- phase 2: sweep configs round-robin across GPUs ------------------------
-echo "=== phase 2: sweep ${#CONFIGS[@]} configs x ${#DS_ARR[@]} datasets ==="
+echo "=== phase 2: sweep ${#CONFIGS[@]} configs x ${#DS_ARR[@]} datasets x ${#MODEL_ARR[@]} models ==="
 JOBS=()
-for ds in "${DS_ARR[@]}"; do for c in "${CONFIGS[@]}"; do JOBS+=("$ds|$c"); done; done
+for m in "${MODEL_ARR[@]}"; do
+  for ds in "${DS_ARR[@]}"; do for c in "${CONFIGS[@]}"; do JOBS+=("$m|$ds|$c"); done; done
+done
 
 dispatch() {
   local slot=$1 gpu=${GPU_ARR[$slot]} idx=0 job
   for job in "${JOBS[@]}"; do
     if (( idx % NGPU == slot )); then
-      IFS='|' read -r ds summ width <<< "$job"
-      local log="bneck_out/${ds}_${summ}${width}.log"
-      echo "[GPU $gpu] START $ds $summ w=$width"
+      IFS='|' read -r m ds summ width <<< "$job"
+      local log="bneck_out/${m##*/}_${ds}_${summ}${width}.log"
+      echo "[GPU $gpu] START ${m##*/} $ds $summ w=$width"
       if CUDA_VISIBLE_DEVICES="$gpu" python bottleneck_probe.py \
-            --dataset "$ds" --summarizer "$summ" --width "$width" \
-            --epochs "$EPOCHS" --seeds "$SEEDS" --batch_size "$BS" --cache_dir "$CACHE_DIR" \
+            --model_id "$m" --dataset "$ds" --summarizer "$summ" --width "$width" \
+            --epochs "$EPOCHS" --seeds "$SEEDS" --batch_size "$BS" $CACHE_FLAG \
             --out_csv "$OUT" > "$log" 2>&1; then
-        echo "[GPU $gpu] DONE  $ds $summ w=$width"
+        echo "[GPU $gpu] DONE  ${m##*/} $ds $summ w=$width"
       else
-        echo "[GPU $gpu] FAIL  $ds $summ w=$width (see $log)"
+        echo "[GPU $gpu] FAIL  ${m##*/} $ds $summ w=$width (see $log)"
       fi
     fi
     idx=$((idx + 1))
@@ -90,13 +110,14 @@ python - "$OUT" <<'PY'
 import csv, sys
 from collections import defaultdict
 rows = list(csv.DictReader(open(sys.argv[1])))
-by_ds = defaultdict(list)
+by_grp = defaultdict(list)
 for r in rows:
-    by_ds[r["dataset"]].append(r)
-for ds, rs in by_ds.items():
+    by_grp[(r.get("model", "?"), r["dataset"])].append(r)
+for (model, ds), rs in by_grp.items():
     base = next((float(r["test_SRCC"]) for r in rs if r["summarizer"] == "ap"), None)
     best = max(rs, key=lambda r: float(r["test_SRCC"]))
-    print(f"\n{ds}:  ALF(ap) baseline SRCC={base:.4f}" if base is not None else f"\n{ds}:")
+    head = f"\n{model} / {ds}:"
+    print(f"{head}  ALF(ap) baseline SRCC={base:.4f}" if base is not None else head)
     for r in sorted(rs, key=lambda r: (r["summarizer"], int(r["width"]))):
         d = (float(r["test_SRCC"]) - base) if base is not None else 0.0
         flag = "  <-- best" if r is best else ""
@@ -106,7 +127,7 @@ for ds, rs in by_ds.items():
         print("  => widest arm ~= ALF: per-layer bottleneck NOT limiting here (negative result)")
 PY
 
-if [ "$KEEP_CACHE" != "1" ]; then
+if [ "$CACHE" = "1" ] && [ "$KEEP_CACHE" != "1" ]; then
   echo; echo "Removing cache ($CACHE_DIR). Set KEEP_CACHE=1 to keep it."
   rm -rf "$CACHE_DIR"
 fi
