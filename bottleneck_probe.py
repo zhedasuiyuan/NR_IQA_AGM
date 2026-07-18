@@ -9,12 +9,20 @@ Everything downstream of the summarizer is identical across arms -- a single
 learned-query PMA fuses the per-layer summary tokens, then a linear predicts MOS.
 Only the SUMMARIZER changes:
 
-  * ``mean`` -- mean over tokens -> 1 vector/layer. The ALF-on-SigLIP baseline
-                (SigLIP2 has no CLS, so CLS+AP degenerates to AP=mean).
-  * ``pma``  -- learned k-query attention pool -> k vectors/layer (Set Transformer
-                PMA_k). ``--width`` = k, the task-driven bottleneck width.
-  * ``tome`` -- parameter-free bipartite token merging -> r vectors/layer (Bolya
-                et al., ToMe). ``--width`` = r, content-adaptive allocation.
+The only thing that changes across arms is how the PATCH grid is summarized --
+CLS rides along in every arm (``--keep_cls``, default on) as a constant add-on,
+so the variable under study is purely the patch-summary WIDTH:
+
+  * ``ap``   -- mean over patch tokens -> 1 patch vector/layer (width 1). With
+                CLS kept, ``ap`` == ALF (CLS + AP): the baseline to beat.
+  * ``pma``  -- learned k-query attention pool -> k patch vectors/layer (Set
+                Transformer PMA_k). ``--width`` = k.
+  * ``tome`` -- parameter-free bipartite token merging -> r patch vectors/layer
+                (Bolya et al., ToMe). ``--width`` = r, content-adaptive.
+
+So each layer's summary is ``[CLS?] + <width> patch tokens``. Leading CLS/register
+tokens are auto-detected and excluded from the patch summarizer (SigLIP2 has none
+-> CLS prepend is a no-op and ``ap`` == mean).
 
 The frozen backbone forwards ONCE; all layers' tokens are cached as an fp16
 memmap keyed by (dataset, seed) and REUSED across summarizer configs, so a whole
@@ -48,10 +56,21 @@ from transformers import AutoImageProcessor, AutoModel, AutoProcessor
 from configs.default import MODEL_CONFIG, _make_dataset_paths
 from dataset import build_splits
 from models.multi_layer_fusion import (
+    _unwrap_backbone,
+    _vision_config,
     backbone_hidden_size,
     backbone_num_hidden_layers,
 )
 from probe_layers import _build_layer_cache
+
+
+def num_prefix_tokens(model, ntok):
+    """How many leading non-patch tokens the hidden states carry (CLS + any
+    register tokens). ``ntok - num_patches``; 0 for SigLIP2 (no CLS)."""
+    cfg = _vision_config(_unwrap_backbone(model))
+    img = cfg.image_size[0] if isinstance(cfg.image_size, (list, tuple)) else cfg.image_size
+    n_patches = (img // cfg.patch_size) ** 2
+    return max(0, int(ntok) - n_patches)
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +124,10 @@ def tome_reduce(x, target):
 # -> linear. Only the summarizer differs across arms.
 # ---------------------------------------------------------------------------
 class Readout(nn.Module):
-    def __init__(self, kind, dim, L, width, heads=8):
+    def __init__(self, kind, dim, L, width, heads=8, n_prefix=0, keep_cls=True):
         super().__init__()
-        self.kind, self.width, self.L = kind, width, L
+        self.kind, self.width, self.L, self.n_prefix = kind, width, L, n_prefix
+        self.keep_cls = keep_cls and n_prefix >= 1        # CLS available and wanted
         self.in_norm = nn.LayerNorm(dim)                 # kill per-layer scale gap
         if kind == "pma":
             self.q = nn.Parameter(torch.randn(L, width, dim) * dim ** -0.5)
@@ -123,16 +143,19 @@ class Readout(nn.Module):
         x = self.in_norm(x)
         outs = []
         for li in range(L):
-            xl = x[:, li]                                # [B,N,D]
-            if self.kind == "mean":
-                s = xl.mean(1, keepdim=True)
+            xl = x[:, li]                                # [B,N,D] (incl. prefix)
+            patch = xl[:, self.n_prefix:]               # patch tokens only
+            if self.kind == "ap":
+                s = patch.mean(1, keepdim=True)          # width 1 (== ALF's AP)
             elif self.kind == "pma":
                 q = self.q[li].unsqueeze(0).expand(B, -1, -1)
-                s, _ = self.summ_attn(q, xl, xl)
+                s, _ = self.summ_attn(q, patch, patch)   # width k
             elif self.kind == "tome":
-                s = tome_reduce(xl, self.width)
+                s = tome_reduce(patch, self.width)       # width r
             else:
                 raise ValueError(self.kind)
+            if self.keep_cls:                            # CLS rides along, every arm
+                s = torch.cat([xl[:, :1], s], dim=1)
             outs.append(s + self.layer_emb[li])
         return torch.cat(outs, dim=1)
 
@@ -168,18 +191,18 @@ def _eval(head, mm, y, device, bs):
     head.eval()
     preds = []
     for i in range(0, mm.shape[0], bs):
-        toks = torch.from_numpy(np.ascontiguousarray(mm[i:i + bs])).to(device).float()
+        toks = torch.from_numpy(np.ascontiguousarray(mm[i:i + bs]).copy()).to(device).float()
         preds.append(head(toks).cpu())
     pr = torch.cat(preds).numpy()
     return spearmanr(pr, y)[0], pearsonr(pr, y)[0]
 
 
 def train_head(kind, width, dim, L, tr_mm, ytr, va_mm, yva, te_mm, yte,
-               device, bs, epochs, lr, heads, seed):
+               device, bs, epochs, lr, heads, seed, n_prefix=0, keep_cls=True):
     """Train one Readout on the cached tokens; early-stop on val SRCC; return
     ``(test_srcc, test_plcc, best_val_srcc, n_summary_tokens)``."""
     torch.manual_seed(seed)
-    head = Readout(kind, dim, L, width, heads).to(device)
+    head = Readout(kind, dim, L, width, heads, n_prefix, keep_cls).to(device)
     opt = torch.optim.Adam(head.parameters(), lr=lr, weight_decay=1e-4)
     N = tr_mm.shape[0]
     rng = np.random.default_rng(seed)
@@ -189,7 +212,7 @@ def train_head(kind, width, dim, L, tr_mm, ytr, va_mm, yva, te_mm, yte,
         order = rng.permutation(N)
         for i in range(0, N, bs):
             bidx = np.sort(order[i:i + bs])              # sorted -> sequential reads
-            toks = torch.from_numpy(np.ascontiguousarray(tr_mm[bidx])).to(device).float()
+            toks = torch.from_numpy(np.ascontiguousarray(tr_mm[bidx]).copy()).to(device).float()
             y = torch.from_numpy(ytr[bidx]).to(device).float()
             opt.zero_grad()
             loss = F.mse_loss(head(toks), y)
@@ -200,7 +223,8 @@ def train_head(kind, width, dim, L, tr_mm, ytr, va_mm, yva, te_mm, yte,
             best_val, best_state = vs, copy.deepcopy(head.state_dict())
     if best_state is not None:
         head.load_state_dict(best_state)
-    T = L if kind == "mean" else L * width
+    patch_w = 1 if kind == "ap" else width
+    T = L * (patch_w + (1 if head.keep_cls else 0))     # +CLS/layer when kept
     ts, tp = _eval(head, te_mm, yte, device, bs)
     return ts, tp, best_val, T
 
@@ -211,8 +235,11 @@ def main():
     p.add_argument("--dataset", type=str, default="KADID10K")
     p.add_argument("--data_dir", type=str, default="./Dataset")
     p.add_argument("--model_id", type=str, default=MODEL_CONFIG["model_id"])
-    p.add_argument("--summarizer", choices=["mean", "pma", "tome"], default="mean")
-    p.add_argument("--width", type=int, default=1, help="k (pma) or r (tome); mean ignores it")
+    p.add_argument("--summarizer", choices=["ap", "pma", "tome"], default="ap",
+                   help="patch summarizer; 'ap'+keep_cls == ALF baseline")
+    p.add_argument("--width", type=int, default=1, help="k (pma) or r (tome); ap ignores it")
+    p.add_argument("--keep_cls", action=argparse.BooleanOptionalAction, default=True,
+                   help="prepend CLS to every layer summary when present (no-op on SigLIP)")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -256,12 +283,16 @@ def main():
         print(f"Cache ready at {cache_root}")
         return
 
-    print(f"[{args.dataset}] {args.summarizer} width={args.width}  "
-          f"{H} layers, D={dim}, {args.seeds} seed(s), {args.epochs} epochs")
+    n_prefix = num_prefix_tokens(model, tr_mm.shape[2])  # CLS/register tokens, 0 for SigLIP
+    cls_on = args.keep_cls and n_prefix >= 1
+    print(f"[{args.dataset}] {args.summarizer} width={args.width} keep_cls={cls_on}  "
+          f"{H} layers, D={dim}, Ntok={tr_mm.shape[2]}, prefix={n_prefix} "
+          f"({'CLS present' if n_prefix else 'no CLS'}), {args.seeds} seed(s), {args.epochs} epochs")
     t0 = time.time()
     results = [train_head(args.summarizer, args.width, dim, H, tr_mm, ytr, va_mm, yva,
                           te_mm, yte, args.device, args.batch_size, args.epochs,
-                          args.lr, args.heads, args.seed + s) for s in range(args.seeds)]
+                          args.lr, args.heads, args.seed + s, n_prefix, args.keep_cls)
+               for s in range(args.seeds)]
     srccs = np.array([r[0] for r in results])
     plccs = np.array([r[1] for r in results])
     T = results[0][3]
