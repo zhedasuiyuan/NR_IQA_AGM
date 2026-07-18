@@ -222,6 +222,7 @@ def train_head(kind, width, dim, L, tr_mm, ytr, va_mm, yva, te_mm, yte,
         vs = _eval(head, va_mm, yva, device, bs)[0]
         if vs > best_val:
             best_val, best_state = vs, copy.deepcopy(head.state_dict())
+        print(f"    seed{seed} ep {ep + 1:2d}/{epochs} val SRCC={vs:.4f} (best {best_val:.4f})", flush=True)
     if best_state is not None:
         head.load_state_dict(best_state)
     patch_w = 1 if kind == "ap" else width
@@ -268,6 +269,7 @@ def train_head_live(kind, width, dim, L, model, processor, train_ds, val_ds, tes
         vs = ev(val_ds)[0]
         if vs > best_val:
             best_val, best_state = vs, copy.deepcopy(head.state_dict())
+        print(f"    seed{seed} ep {ep + 1:2d}/{epochs} val SRCC={vs:.4f} (best {best_val:.4f})", flush=True)
     if best_state is not None:
         head.load_state_dict(best_state)
     patch_w = 1 if kind == "ap" else width
