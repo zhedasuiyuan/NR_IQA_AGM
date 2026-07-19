@@ -23,7 +23,8 @@
 # The flag handles a single leading CLS; DINOv2 *register* variants (>1 prefix
 # token) are only approximately handled (registers counted as patches).
 #
-# Results (test SRCC/PLCC + wall-clock) -> summary_out/summary_results.csv.
+# Results (test SRCC/PLCC + wall-clock) -> summary_out/<timestamp>/summary_results.csv
+# (per-run subfolder so reruns don't overwrite; RUN=<name> overrides the stamp).
 #
 # Usage:
 #   ./run_summary.sh                          # SigLIP2, KADID10K + KonIQ_10K, 3 GPUs
@@ -44,8 +45,12 @@ read -ra MODEL_ARR <<< "$MODELS"
 read -ra DS_ARR  <<< "$DATASETS"
 read -ra GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
-mkdir -p summary_out
-rm -f summary_out/row_*.csv
+
+# Per-run dir (timestamp) so reruns don't overwrite each other's logs/results.
+RUN="${RUN:-$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="summary_out/${RUN}"
+mkdir -p "$RUN_DIR"
+echo "Outputs -> $RUN_DIR"
 
 # ---- aggregator configs (all over ALL layers via --fusion_stride 1) --------
 # alf/summary arms get --alf_use_cls appended per-model (see cls_flag below).
@@ -81,7 +86,7 @@ dispatch() {
       case "$label" in alf*|sum*) flags="$flags $(cls_flag_for "$m")" ;; esac
       local mtag="${m##*/}"
       local stage="summary_${mtag}_${ds}_${label}"
-      local log="summary_out/${stage}.log"
+      local log="$RUN_DIR/${stage}.log"
       echo "[GPU $gpu] START $mtag $ds $label -> $log"
       local start=$SECONDS
       CUDA_VISIBLE_DEVICES="$gpu" python train.py \
@@ -91,7 +96,7 @@ dispatch() {
       if [ $rc -eq 0 ]; then echo "[GPU $gpu] DONE  $mtag $ds $label (${dur}s)"
       else echo "[GPU $gpu] FAIL rc=$rc $mtag $ds $label (see $log)"; fi
       local res="results/results_${stage}_Train_${ds}_Test_${ds}.json"
-      python - "$res" "$mtag" "$ds" "$label" "$dur" > "summary_out/row_${stage}.csv" <<'PY'
+      python - "$res" "$mtag" "$ds" "$label" "$dur" > "$RUN_DIR/row_${stage}.csv" <<'PY'
 import json, sys
 res, m, ds, label, dur = sys.argv[1:6]
 try:
@@ -108,9 +113,9 @@ for slot in "${!GPU_ARR[@]}"; do dispatch "$slot" & done
 wait
 
 # ---- assemble + report -----------------------------------------------------
-out="summary_out/summary_results.csv"
+out="$RUN_DIR/summary_results.csv"
 echo "model,dataset,aggregator,val_SRCC,test_SRCC,test_PLCC,wall_s" > "$out"
-cat summary_out/row_*.csv 2>/dev/null | sort >> "$out"
+cat "$RUN_DIR"/row_*.csv 2>/dev/null | sort >> "$out"
 echo
 echo "=== summary-fusion LoRA comparison ($out) ==="
 column -s, -t "$out" 2>/dev/null || cat "$out"
