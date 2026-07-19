@@ -452,7 +452,10 @@ class TokenALFusion(nn.Module):
     def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
         parts = []
         for f in layer_features:
-            ap = f.mean(dim=1, keepdim=True)                 # [B, 1, D] average-pool
+            # ALF's AP is over PATCH tokens only (paper: h_AP = 1/P sum_{i=1..P} z_i);
+            # exclude the CLS token (z_0) when it is kept as its own summary token.
+            patch = f[:, 1:] if self.use_cls else f
+            ap = patch.mean(dim=1, keepdim=True)             # [B, 1, D] average-pool
             parts.append(torch.cat([f[:, :1], ap], dim=1) if self.use_cls else ap)
         summ = torch.cat(parts, dim=1)                       # [B, (2 or 1)*L, D]
         q = self.query.expand(summ.shape[0], -1, -1).to(summ.dtype)  # [B, 1, D]
