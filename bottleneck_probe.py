@@ -302,6 +302,9 @@ def main():
                         "(use when the cache is disk-I/O-bound)")
     p.add_argument("--max_images", type=int, default=None, help="cap all splits (smoke test)")
     p.add_argument("--build_cache_only", action="store_true", help="build cache and exit")
+    p.add_argument("--preload", action="store_true",
+                   help="load the whole cache into RAM once (memcpy reads instead of "
+                        "per-batch disk); use when the cache fits RAM, e.g. CLIP/DINO")
     p.add_argument("--out_csv", type=str, default="bneck_out/bneck_results.csv")
     args = p.parse_args()
 
@@ -336,6 +339,10 @@ def main():
         if args.build_cache_only:
             print(f"Cache ready at {cache_root}")
             return
+        if args.preload:  # pull the whole cache into RAM once -> reads are memcpy,
+            gb = sum(m.nbytes for m in (tr_mm, va_mm, te_mm)) / 1e9  # not per-batch disk
+            print(f"  [preload] loading {gb:.0f} GB cache into RAM ...", flush=True)
+            tr_mm, va_mm, te_mm = np.array(tr_mm), np.array(va_mm), np.array(te_mm)
         ntok = tr_mm.shape[2]
         fit = lambda s: train_head(args.summarizer, args.width, *common, tr_mm, ytr,
                                    va_mm, yva, te_mm, yte, args.device, args.batch_size,

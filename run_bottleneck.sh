@@ -39,6 +39,8 @@ SEED="${SEED:-42}"                        # split seed (cache path embeds it)
 BS="${BS:-16}"                           # per-step batch (reads [B,L,N,D] into GPU)
 CACHE="${CACHE:-1}"                       # 0 = no cache: forward backbone per epoch
                                           #     (avoids disk I/O; re-forwards per config)
+PRELOAD="${PRELOAD:-0}"                    # 1 = load cache into RAM per config (memcpy
+                                          #     reads); use when it fits, e.g. CLIP/DINO
 CACHE_DIR="${CACHE_DIR:-/data/bneck_cache}"
 KEEP_CACHE="${KEEP_CACHE:-1}"             # 1 = keep the token cache (default); 0 = delete after sweep
 
@@ -60,9 +62,13 @@ echo "Run outputs -> $RUN_DIR"
 # ---- summarizer configs: "summarizer|width" -------------------------------
 CONFIGS=("ap|1" "pma|1" "pma|2" "pma|4" "pma|8" "tome|2" "tome|4" "tome|8")
 
-# --cache_dir flag shared by both phases; empty in no-cache mode.
+# --cache_dir flag for the sweep; empty in no-cache mode. --preload (RAM) only
+# applies to the sweep, not the build.
 CACHE_FLAG=""
-[ "$CACHE" = "1" ] && CACHE_FLAG="--cache_dir $CACHE_DIR"
+if [ "$CACHE" = "1" ]; then
+  CACHE_FLAG="--cache_dir $CACHE_DIR"
+  [ "$PRELOAD" = "1" ] && CACHE_FLAG="$CACHE_FLAG --preload"
+fi
 
 # ---- phase 1: build one cache per (model, dataset) (serial; first GPU) ------
 # Skip a build whose 3 split files already exist (cache path mirrors
