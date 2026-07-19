@@ -61,6 +61,7 @@ from models.multi_layer_fusion import (
     backbone_hidden_size,
     backbone_num_hidden_layers,
     extract_token_features,
+    tome_reduce,
 )
 from probe_layers import _build_layer_cache, _to_pixel_values
 
@@ -72,52 +73,6 @@ def num_prefix_tokens(model, ntok):
     img = cfg.image_size[0] if isinstance(cfg.image_size, (list, tuple)) else cfg.image_size
     n_patches = (img // cfg.patch_size) ** 2
     return max(0, int(ntok) - n_patches)
-
-
-# ---------------------------------------------------------------------------
-# Parameter-free token merging (ToMe, Bolya et al. ICLR'23): bipartite soft
-# matching applied repeatedly until a layer's tokens are reduced to ``target``.
-# Merges are size-weighted so a merged token stays an unbiased mean of the
-# originals it absorbed. No learned parameters -- allocation is content-adaptive.
-# ---------------------------------------------------------------------------
-def _merge_step(x, size, r):
-    """One bipartite-matching merge: remove ``r`` of the alternating-split
-    a-tokens into their most-similar b-token. ``x``: [B,N,D], ``size``: [B,N,1]."""
-    B, N, D = x.shape
-    m = F.normalize(x, dim=-1)
-    a, b = m[:, ::2], m[:, 1::2]                          # [B,na,D], [B,nb,D]
-    xa, xb = x[:, ::2], x[:, 1::2]
-    sa, sb = size[:, ::2], size[:, 1::2]
-    scores = a @ b.transpose(-1, -2)                      # [B,na,nb]
-    node_max, node_idx = scores.max(dim=-1)              # best b-match per a-token
-    edge = node_max.argsort(dim=-1, descending=True)     # most-similar first
-    src_i = edge[:, :r]                                   # a-tokens to merge away
-    unm_i = edge[:, r:]                                   # a-tokens kept
-    dst_i = node_idx.gather(1, src_i)                     # their b targets
-
-    gd = lambda t, idx, c: t.gather(1, idx[..., None].expand(-1, -1, c))
-    num = (xb * sb).clone()                               # weighted sum accumulator
-    den = sb.clone()
-    src_val = gd(xa, src_i, D) * gd(sa, src_i, 1)
-    num.scatter_add_(1, dst_i[..., None].expand(-1, -1, D), src_val)
-    den.scatter_add_(1, dst_i[..., None].expand(-1, -1, 1), gd(sa, src_i, 1))
-    xb_new, sb_new = num / den, den
-
-    x = torch.cat([gd(xa, unm_i, D), xb_new], dim=1)
-    size = torch.cat([gd(sa, unm_i, 1), sb_new], dim=1)
-    return x, size
-
-
-def tome_reduce(x, target):
-    """Reduce ``x`` [B,N,D] to [B,target,D] by repeated bipartite merging."""
-    if x.shape[1] <= target:
-        return x
-    size = torch.ones(x.shape[0], x.shape[1], 1, device=x.device, dtype=x.dtype)
-    while x.shape[1] > target:
-        n = x.shape[1]
-        na = (n + 1) // 2                                # max mergeable this step
-        x, size = _merge_step(x, size, min(n - target, na))
-    return x
 
 
 # ---------------------------------------------------------------------------

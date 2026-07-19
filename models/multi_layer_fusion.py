@@ -42,6 +42,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 _VALID_CONDITIONING = ("uniform", "static", "image")
@@ -191,6 +192,49 @@ def native_pool(model: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
 def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Parameter-free RMSNorm over the last dim (RAE-V2 MLS normalisation)."""
     return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+# ---------------------------------------------------------------------------
+# Parameter-free token merging (ToMe, Bolya et al. ICLR'23): bipartite soft
+# matching applied repeatedly until a layer's tokens are reduced to ``target``.
+# Merges are size-weighted so a merged token stays an unbiased mean of the
+# originals it absorbed. Used by TokenSummaryFusion (and bottleneck_probe.py).
+# ---------------------------------------------------------------------------
+def _merge_step(x: torch.Tensor, size: torch.Tensor, r: int):
+    """One bipartite-matching merge: fold ``r`` of the alternating-split a-tokens
+    into their most-similar b-token. ``x``: [B,N,D], ``size``: [B,N,1]."""
+    B, N, D = x.shape
+    m = F.normalize(x, dim=-1)
+    a, b = m[:, ::2], m[:, 1::2]
+    xa, xb = x[:, ::2], x[:, 1::2]
+    sa, sb = size[:, ::2], size[:, 1::2]
+    scores = a @ b.transpose(-1, -2)                     # [B,na,nb]
+    node_max, node_idx = scores.max(dim=-1)
+    edge = node_max.argsort(dim=-1, descending=True)
+    src_i, unm_i = edge[:, :r], edge[:, r:]
+    dst_i = node_idx.gather(1, src_i)
+
+    gd = lambda t, idx, c: t.gather(1, idx[..., None].expand(-1, -1, c))
+    num = (xb * sb).clone()
+    den = sb.clone()
+    num.scatter_add_(1, dst_i[..., None].expand(-1, -1, D), gd(xa, src_i, D) * gd(sa, src_i, 1))
+    den.scatter_add_(1, dst_i[..., None].expand(-1, -1, 1), gd(sa, src_i, 1))
+    x = torch.cat([gd(xa, unm_i, D), num / den], dim=1)
+    size = torch.cat([gd(sa, unm_i, 1), den], dim=1)
+    return x, size
+
+
+def tome_reduce(x: torch.Tensor, target: int) -> torch.Tensor:
+    """Reduce ``x`` [B,N,D] to [B,target,D] by repeated size-weighted bipartite
+    merging (parameter-free)."""
+    if x.shape[1] <= target:
+        return x
+    size = torch.ones(x.shape[0], x.shape[1], 1, device=x.device, dtype=x.dtype)
+    while x.shape[1] > target:
+        n = x.shape[1]
+        na = (n + 1) // 2
+        x, size = _merge_step(x, size, min(n - target, na))
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +460,76 @@ class TokenALFusion(nn.Module):
         return pooled[:, 0]                                  # [B, D] -> straight to head
 
 
+class TokenSummaryFusion(nn.Module):
+    """Widened-summary attentive layer fusion -- generalizes :class:`TokenALFusion`.
+
+    Each tapped layer is summarized into a few tokens by ``summarizer``:
+      * ``ap``   -- mean patch token (1/layer; == ALF's AP);
+      * ``pma``  -- ``width`` learned-query attention-pooled tokens (Set Transformer);
+      * ``tome`` -- ``width`` parameter-free bipartite-merged tokens (ToMe).
+    optionally prefixed with the CLS token (``keep_cls``; token 0). A single
+    learned query then cross-attends over all layers' summary tokens (+ a per-layer
+    embedding) and returns the pooled ``[B, D]`` vector directly -- replacing
+    ``native_pool`` (so ``returns_pooled`` is True), exactly like ALF.
+
+    Efficiency vs :class:`TokenCrossAttentionFusion`: the cross-layer key/value is
+    ``L*width`` (+CLS) tokens instead of the full ``L*N`` spatial tokens, so the
+    attention is far cheaper -- the point of this arm is to match/beat spatial
+    cross-attention at a fraction of its compute.
+
+    ``ap`` with ``keep_cls`` is exactly ALF; ``pma``/``tome`` widen the per-layer
+    summary. Patch tokens exclude the CLS prefix, so ToMe never merges it and the
+    width accounting stays clean. (Register tokens beyond a single CLS are not
+    special-cased -- like TokenALFusion, this assumes at most one prefix token.)
+    """
+
+    def __init__(self, num_layers: int, dim: int, summarizer: str = "pma",
+                 width: int = 4, num_heads: int = 8, dropout: float = 0.0,
+                 keep_cls: bool = False):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(
+                f"hidden_size {dim} is not divisible by fusion_num_heads {num_heads}."
+            )
+        if summarizer not in ("ap", "pma", "tome"):
+            raise ValueError(f"summarizer='{summarizer}' invalid; expected ap/pma/tome")
+        if summarizer != "ap" and width < 1:
+            raise ValueError(f"summary_width must be >= 1, got {width}")
+        self.summarizer = summarizer
+        self.width = width
+        self.keep_cls = keep_cls
+        self.n_prefix = 1 if keep_cls else 0
+        self.in_norm = nn.LayerNorm(dim)                     # kill per-layer scale gap
+        if summarizer == "pma":
+            self.query = nn.Parameter(torch.randn(num_layers, width, dim) * dim ** -0.5)
+            self.summ_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True,
+                                                   dropout=dropout)
+        self.layer_emb = nn.Parameter(torch.zeros(num_layers, dim))  # per-layer provenance
+        self.cross_q = nn.Parameter(torch.randn(1, 1, dim) * dim ** -0.5)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True,
+                                                dropout=dropout)
+
+    def forward(self, layer_features: List[torch.Tensor], trunk: torch.Tensor) -> torch.Tensor:
+        parts = []
+        for li, f in enumerate(layer_features):
+            f = self.in_norm(f)
+            patch = f[:, self.n_prefix:]                     # exclude CLS from the summarizer
+            if self.summarizer == "ap":
+                s = patch.mean(dim=1, keepdim=True)
+            elif self.summarizer == "pma":
+                q = self.query[li].unsqueeze(0).expand(f.shape[0], -1, -1).to(f.dtype)
+                s, _ = self.summ_attn(q, patch, patch)
+            else:  # tome
+                s = tome_reduce(patch, self.width)
+            if self.keep_cls:
+                s = torch.cat([f[:, :1], s], dim=1)
+            parts.append(s + self.layer_emb[li].to(f.dtype))
+        summ = torch.cat(parts, dim=1)                       # [B, L*(width[+1]), D]
+        q = self.cross_q.expand(summ.shape[0], -1, -1).to(summ.dtype)
+        pooled, _ = self.cross_attn(q, summ, summ)
+        return pooled[:, 0]                                  # [B, D] -> straight to head
+
+
 # ---------------------------------------------------------------------------
 # Container: holds the fusion module + the resolved layer indices, with
 # self-describing save/load so eval can rebuild without CLI flags.
@@ -442,6 +556,8 @@ class MultiLayerFusion(nn.Module):
         dropout: float = 0.0,
         alf_use_cls: bool = False,
         fusion_query_layer: Optional[int] = None,
+        summarizer: str = "pma",
+        summary_width: int = 4,
     ):
         super().__init__()
         self.fusion_type = fusion_type
@@ -487,15 +603,22 @@ class MultiLayerFusion(nn.Module):
                 dim=hidden_size, num_heads=fusion_num_heads, dropout=dropout,
                 use_cls=alf_use_cls,
             )
+        elif fusion_type == "summary":
+            self.fuser = TokenSummaryFusion(
+                num_layers=L, dim=hidden_size, summarizer=summarizer,
+                width=summary_width, num_heads=fusion_num_heads, dropout=dropout,
+                keep_cls=alf_use_cls,
+            )
         else:
             raise ValueError(
                 f"fusion_type='{fusion_type}' invalid; expected "
-                "'mls', 'soft_mls', 'adaptive', 'cross_attention', or 'alf'"
+                "'mls', 'soft_mls', 'adaptive', 'cross_attention', 'alf', or 'summary'"
             )
 
-        # ALF outputs the pooled [B, D] vector directly (replaces native_pool);
-        # every other fuser returns [B, N, D] tokens that native_pool then pools.
-        self.returns_pooled = fusion_type == "alf"
+        # ALF / summary output the pooled [B, D] vector directly (replace
+        # native_pool); every other fuser returns [B, N, D] tokens that
+        # native_pool then pools.
+        self.returns_pooled = fusion_type in ("alf", "summary")
 
         # Self-describing config for checkpoint round-trips.
         self.config = dict(
@@ -509,6 +632,8 @@ class MultiLayerFusion(nn.Module):
             dropout=dropout,
             alf_use_cls=alf_use_cls,
             fusion_query_layer=fusion_query_layer,
+            summarizer=summarizer,
+            summary_width=summary_width,
         )
 
     @classmethod

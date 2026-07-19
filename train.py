@@ -301,6 +301,8 @@ def train(args):
             dropout=args.fusion_dropout,
             alf_use_cls=args.alf_use_cls,
             fusion_query_layer=args.fusion_query_layer,
+            summarizer=args.summarizer,
+            summary_width=args.summary_width,
         ).to(device).to(torch.bfloat16)
         fusion.requires_grad_(True)
         print(f"Multi-layer fusion: type={args.fusion_type} "
@@ -699,7 +701,8 @@ def parse_args():
 
     # Multi-layer fusion
     p.add_argument("--fusion_type", type=str, default="none",
-                   choices=["none", "mls", "soft_mls", "adaptive", "cross_attention", "alf"],
+                   choices=["none", "mls", "soft_mls", "adaptive", "cross_attention",
+                            "alf", "summary"],
                    help="Multi-layer feature fusion before the MLP head. "
                         "'none' = vanilla single-layer get_image_features; "
                         "'mls' = RAE-V2 multi-layer sum (hard replace); "
@@ -707,7 +710,11 @@ def parse_args():
                         "alpha init = --fusion_gate_init); "
                         "'adaptive' = learned weighted residual (step-0 identical); "
                         "'cross_attention' = trunk queries the tapped layers' tokens, "
-                        "residual via zero-init out_proj (step-0 identical).")
+                        "residual via zero-init out_proj (step-0 identical); "
+                        "'alf' = attentive fusion of per-layer CLS+AP summaries; "
+                        "'summary' = widened per-layer summary (--summarizer ap/pma/tome, "
+                        "--summary_width) then attentive cross-layer fusion -- ALF's "
+                        "power at a fraction of cross_attention's K/V tokens.")
     p.add_argument("--fusion_stride", type=int, default=4,
                    help="Tap every Nth block, right-anchored on the last block "
                         "(stride=1 taps all layers). Resolved per-backbone from depth.")
@@ -740,9 +747,16 @@ def parse_args():
                         "one of --fusion_layers). Tests querying from a quality-rich "
                         "intermediate layer rather than the semantically-invariant output.")
     p.add_argument("--alf_use_cls", action="store_true",
-                   help="ALF only: use CLS+AP summary tokens per layer (faithful for "
-                        "CLS-bearing backbones like CLIP/DINO). Default AP-only (SigLIP2 "
-                        "has no CLS).")
+                   help="alf/summary: keep the CLS token in each per-layer summary "
+                        "(faithful for CLS-bearing backbones like CLIP/DINO). Default "
+                        "AP/patch-only (SigLIP2 has no CLS).")
+    p.add_argument("--summarizer", type=str, default="pma", choices=["ap", "pma", "tome"],
+                   help="--fusion_type summary: per-layer patch summarizer. 'ap' = mean "
+                        "(== ALF), 'pma' = learned k-query attention pool, 'tome' = "
+                        "parameter-free bipartite token merge.")
+    p.add_argument("--summary_width", type=int, default=4,
+                   help="--fusion_type summary: tokens per layer for pma (k) / tome (r); "
+                        "'ap' ignores it.")
     p.add_argument("--fusion_gate_init", type=float, default=0.0,
                    help="Warm-start the fusion residual. 0.0 = step-0 identical (residual "
                         "off); a small positive value (e.g. 0.1) turns it on at init so the "
