@@ -29,6 +29,7 @@ import argparse
 import copy
 import json
 import os
+import random
 import warnings
 
 import numpy as np
@@ -190,6 +191,15 @@ def evaluate(model, mlp, processor, dataloader_eval, device, dry_run=False, fusi
 # ---------------------------------------------------------------------------
 
 def train(args):
+    # Re-seed from --seed (overrides seed.py's import-time constant) so multi-seed
+    # runs vary the train/val/test split AND the init. Seed 8 == the default.
+    # Mirrors seed.py exactly (incl. the cuDNN flags) for backward compatibility.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     cfg = {**TRAIN_CONFIG}
     cfg.update({
         "epochs":                       args.epochs,
@@ -353,7 +363,7 @@ def train(args):
 
     # ── Dataset / DataLoader ─────────────────────────────────────────────
     # val drives best-checkpoint selection; test is held out for final reporting.
-    train_ds, val_ds, test_ds = build_splits(args.dataset, dataset_paths, Seed)
+    train_ds, val_ds, test_ds = build_splits(args.dataset, dataset_paths, args.seed)
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
         drop_last=True, worker_init_fn=seed_worker,
@@ -818,6 +828,9 @@ def parse_args():
     p.add_argument("--checkpoint_steps", type=int, default=TRAIN_CONFIG["checkpoint_steps"])
     p.add_argument("--max_checkpoints", type=int, default=TRAIN_CONFIG["max_checkpoints"])
     p.add_argument("--stage_name", type=str, default=f"AGM_seed{Seed}")
+    p.add_argument("--seed", type=int, default=Seed,
+                   help="Seed for the train/val/test split and init (default = seed.py's "
+                        "Seed). Vary it for multi-seed averaging over random splits.")
     p.add_argument("--resume", action="store_true")
 
     # Eval
