@@ -50,6 +50,13 @@ class SIGLIPWithMLP(nn.Module):
             )
             features = self.siglip(**inputs).pooler_output
             features = features.squeeze(-1).squeeze(-1)
+        elif not (getattr(getattr(self.siglip, "config", None), "model_type", "")
+                  or "").lower().startswith("siglip"):
+            # CLIP's get_image_features returns the projection dim (not hidden) and
+            # DINOv2 has none -> pool the last hidden state to hidden dim, matching
+            # train.py's no-fusion path. SigLIP keeps get_image_features (below).
+            _, trunk = extract_token_features(self.siglip, inputs, [1])
+            features = native_pool(self.siglip, trunk)
         else:
             try:
                 features = self.siglip.get_image_features(inputs)

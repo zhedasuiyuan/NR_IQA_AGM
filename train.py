@@ -54,6 +54,7 @@ from configs.default import MODEL_CONFIG, TRAIN_CONFIG, DATASET_PATHS, _make_dat
 from dataset import build_splits
 from models import MLP3_Gated, SIGLIPWithMLP, MultiLayerFusion, extract_token_features, native_pool
 from models import DualEncoderFusion, extract_trunk, extract_aux_tokens, aux_hidden_size
+from models.multi_layer_fusion import backbone_hidden_size, backbone_num_hidden_layers
 from models.activations import ParamSigmoid2, ParamLeakyReLU2
 from seed import Seed, seed_worker
 from util import margin_loss, metric, Overlay, BAD_QUALITY_PROMPT, Text_Template_baseline
@@ -64,6 +65,28 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
+
+def _backbone_family(model) -> str:
+    """Coarse backbone family from the HF config: 'siglip', 'clip', 'dino', or 'other'.
+    Drives the (otherwise SigLIP-specific) LoRA targets and the no-fusion forward."""
+    mt = (getattr(getattr(model, "config", None), "model_type", "") or "").lower()
+    if mt.startswith("siglip"):
+        return "siglip"
+    if mt.startswith("clip"):
+        return "clip"
+    if mt.startswith("dinov2") or mt.startswith("dinov3"):
+        return "dino"
+    return "other"
+
+
+def _lora_default_targets(family: str) -> str:
+    """Default LoRA target regex per backbone. SigLIP/CLIP name attention linears
+    q_proj/k_proj under vision_model; DINOv2/3 use attention.attention.query/key
+    and have no vision_model prefix."""
+    if family == "dino":
+        return r".*attention\.attention\.(query|key)$"
+    return r"vision_model\..*\.(q_proj|k_proj)$"
+
 
 def _clean_old_checkpoints(stage_name: str, max_keep: int):
     for pattern in (f"checkpoints/{stage_name}_step*.pt",
@@ -249,9 +272,23 @@ def train(args):
 
     # ── Backbone ─────────────────────────────────────────────────────────
     model = AutoModel.from_pretrained(args.model_id, torch_dtype=torch.bfloat16).to(device)
+    family = _backbone_family(model)
+
+    # The MLP head / dual-encoder query dim must match the backbone hidden size
+    # (SigLIP so400m 1152; CLIP-L / DINOv2-L 1024). Auto-adjust unless it already
+    # matches -> SigLIP (default 1152) is unchanged.
+    _hidden = backbone_hidden_size(model)
+    if args.mlp_input_dim != _hidden:
+        print(f"Backbone '{family}' hidden size {_hidden}: setting mlp_input_dim "
+              f"{args.mlp_input_dim} -> {_hidden}.")
+        args.mlp_input_dim = _hidden
 
     # ── PEFT ─────────────────────────────────────────────────────────────
     if cfg["peft_method"] == "LoRA":
+        # Backbone-appropriate LoRA targets unless the user gave --lora_targets.
+        # (siglip/clip resolve to the original regex, so those are unchanged.)
+        if args.lora_targets is None:
+            cfg["lora_config"]["target_modules"] = _lora_default_targets(family)
         print(f"Applying LoRA (targets={cfg['lora_config']['target_modules']}) ...")
         lora_cfg = LoraConfig(
             r=cfg["lora_config"]["r"],
@@ -520,11 +557,16 @@ def train(args):
                     )
                     fused = fusion(feats, trunk)
                     features = fused if fusion_returns_pooled else native_pool(model, fused)
-                else:
+                elif family == "siglip":
                     try:
                         features = model.module.get_image_features(**inputs)
                     except Exception:
                         features = model.get_image_features(**inputs)
+                else:
+                    # CLIP's get_image_features returns the projection dim (not hidden)
+                    # and DINOv2 has none -> pool the last hidden state to hidden dim.
+                    _, trunk = extract_token_features(model, inputs["pixel_values"], [1])
+                    features = native_pool(model, trunk)
 
                 score = mlp(features)
                 loss_mse    = torch.nn.functional.mse_loss(score.squeeze(1), batch["score"].to(device))
